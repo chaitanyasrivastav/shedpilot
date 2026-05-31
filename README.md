@@ -1,6 +1,6 @@
 # shedpilot
 
-**Adaptive load shedding for Istio. One CRD. Sub-200ms profile switches.**
+**Adaptive load shedding for Envoy-based service meshes. One CRD. Sub-200ms profile switches.**
 
 When traffic spikes, autoscaling takes 2–5 minutes to provision new capacity. During that gap, your service queues requests, latency climbs, and callers cascade into failure. shedpilot bridges that gap — switching your service into a protective profile in under 200ms when conditions are met, then automatically restoring when the service recovers.
 
