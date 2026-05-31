@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/shedpilot-io/operator/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
 )
 
 const (

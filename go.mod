@@ -1,4 +1,4 @@
-module github.com/shedpilot-io/operator
+module github.com/chaitanyasrivastav/shedpilot
 
 go 1.26.3
 

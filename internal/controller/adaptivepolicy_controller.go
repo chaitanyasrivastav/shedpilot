@@ -23,11 +23,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/shedpilot-io/operator/api/v1alpha1"
-	"github.com/shedpilot-io/operator/internal/renderer"
-	"github.com/shedpilot-io/operator/internal/rtds"
-	"github.com/shedpilot-io/operator/internal/signal"
-	"github.com/shedpilot-io/operator/internal/trigger"
+	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/internal/renderer"
+	"github.com/chaitanyasrivastav/shedpilot/internal/rtds"
+	"github.com/chaitanyasrivastav/shedpilot/internal/signal"
+	"github.com/chaitanyasrivastav/shedpilot/internal/trigger"
 )
 
 // +kubebuilder:rbac:groups=resilience.shedpilot.io,resources=adaptivepolicies,verbs=get;list;watch;create;update;patch;delete

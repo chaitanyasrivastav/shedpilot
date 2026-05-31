@@ -14,9 +14,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/shedpilot-io/operator/api/v1alpha1"
-	"github.com/shedpilot-io/operator/internal/controller"
-	"github.com/shedpilot-io/operator/internal/rtds"
+	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/internal/controller"
+	"github.com/chaitanyasrivastav/shedpilot/internal/rtds"
 )
 
 var (

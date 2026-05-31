@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/shedpilot-io/operator/test/utils"
+	"github.com/chaitanyasrivastav/shedpilot/test/utils"
 )
 
 var (

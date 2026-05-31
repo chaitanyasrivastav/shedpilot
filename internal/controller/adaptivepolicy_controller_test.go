@@ -27,9 +27,9 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	resiliencev1alpha1 "github.com/shedpilot-io/operator/api/v1alpha1"
-	"github.com/shedpilot-io/operator/internal/signal"
-	"github.com/shedpilot-io/operator/internal/trigger"
+	resiliencev1alpha1 "github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/internal/signal"
+	"github.com/chaitanyasrivastav/shedpilot/internal/trigger"
 )
 
 var _ = Describe("AdaptivePolicy Controller", func() {

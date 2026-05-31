@@ -6,7 +6,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/shedpilot-io/operator/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
 )
 
 // DetectAndBuild auto-detects the mesh backend and returns the correct

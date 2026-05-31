@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/shedpilot-io/operator/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
 )
 
 // Signals holds the live metric values read from the service.

@@ -33,7 +33,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	resiliencev1alpha1 "github.com/shedpilot-io/operator/api/v1alpha1"
+	resiliencev1alpha1 "github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 

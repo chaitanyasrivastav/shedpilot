@@ -35,8 +35,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/shedpilot-io/operator/api/v1alpha1"
-	"github.com/shedpilot-io/operator/internal/trigger"
+	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/internal/trigger"
 )
 
 const (
