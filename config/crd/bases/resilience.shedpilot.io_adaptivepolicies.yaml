@@ -1,0 +1,892 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: adaptivepolicies.resilience.shedpilot.io
+spec:
+  group: resilience.shedpilot.io
+  names:
+    categories:
+    - adaptive-mesh
+    kind: AdaptivePolicy
+    listKind: AdaptivePolicyList
+    plural: adaptivepolicies
+    shortNames:
+    - ap
+    singular: adaptivepolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.detectedBackend
+      name: Backend
+      type: string
+    - jsonPath: .status.activeProfile
+      name: Profile
+      type: string
+    - jsonPath: .spec.dryRun
+      name: DryRun
+      type: boolean
+    - jsonPath: .status.shedRateNow
+      name: Shed
+      type: string
+    - jsonPath: .status.rtdsConnected
+      name: RTDS
+      type: boolean
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "AdaptivePolicy configures adaptive load management for a workload
+          in an\nIstio or Cilium service mesh.\n\nQuick start — the simplest useful
+          policy:\n\n\tspec:\n\t  selector: {app: payments}\n\t  dryRun: true                    #
+          observe for 2 weeks first\n\t  adaptiveConcurrency:\n\t    enabled: true\n\t
+          \ admissionControl:\n\t    enabled: true\n\nWith profiles and triggers:\n\n\tspec:\n\t
+          \ selector: {app: payments}\n\t  adaptiveConcurrency: {enabled: true}\n\t
+          \ admissionControl: {enabled: true, successRateThreshold: \"95.0\"}\n\t
+          \ profiles:\n\t    degraded:\n\t      admissionControl: {successRateThreshold:
+          \"85.0\", sheddingSpeed: \"2.0\"}\n\t  triggers:\n\t  - name: degradation-detected\n\t
+          \   when: {successRate: {below: 0.90, consecutiveSamples: 2}}\n\t    switchTo:
+          degraded\n\nEscape hatches:\n\n\t# Freeze brain patches (keep enforcement
+          running):\n\tkubectl annotate adaptivepolicy payments adaptive-mesh.io/human-override=true\n\n\t#
+          Observe only (keep filters installed, disable rejection):\n\tkubectl patch
+          adaptivepolicy payments --type merge -p '{\"spec\":{\"dryRun\":true}}'\n\n\t#
+          Remove everything (cascade deletes all EnvoyFilters):\n\tkubectl delete
+          adaptivepolicy payments"
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AdaptivePolicySpec defines the desired state of an AdaptivePolicy.
+            properties:
+              activeProfile:
+                description: |-
+                  ActiveProfile is the currently enforced profile name.
+                  Must match a key in spec.profiles, or be empty to use baseline config.
+                  Changed by: triggers firing, schedules firing, or direct human patch.
+                  The controller renders the merged config (baseline + active profile overrides).
+                type: string
+              adaptiveConcurrency:
+                description: |-
+                  AdaptiveConcurrency is the baseline config for the gradient controller
+                  filter. Profile overrides take precedence when a profile is active.
+                  Omit to disable this filter entirely.
+                properties:
+                  concurrencyAdjustInterval:
+                    default: 100ms
+                    description: ConcurrencyAdjustInterval is how often the concurrency
+                      limit is recomputed.
+                    type: string
+                  concurrencyLimit:
+                    default: 0
+                    description: |-
+                      ConcurrencyLimit is an optional hard cap on the computed limit.
+                      0 means no hard cap.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  enabled:
+                    default: true
+                    description: Enabled toggles the filter. When false, the EnvoyFilter
+                      is deleted.
+                    type: boolean
+                  latencyBaselineInterval:
+                    default: 60s
+                    description: |-
+                      LatencyBaselineInterval is how often Envoy recalculates the minimum RTT baseline.
+                      Shorter = adapts faster but more measurement disruption (elevated 503s).
+                    type: string
+                  latencyBaselineSampleSize:
+                    default: 50
+                    description: LatencyBaselineSampleSize is requests sampled per
+                      minRTT measurement window.
+                    format: int32
+                    maximum: 500
+                    minimum: 10
+                    type: integer
+                  latencyPercentile:
+                    allOf:
+                    - enum:
+                      - p50
+                      - p75
+                      - p90
+                      - p99
+                    - enum:
+                      - p50
+                      - p75
+                      - p90
+                      - p99
+                    default: p50
+                    description: LatencyPercentile is the latency percentile used
+                      as the ideal baseline.
+                    type: string
+                  maxLoadIncrease:
+                    default: "2.0"
+                    description: MaxLoadIncrease caps the multiplier between intervals.
+                      Prevents runaway scaling.
+                    type: string
+                  measurementJitter:
+                    default: 10
+                    description: MeasurementJitter prevents synchronised measurement
+                      across replicas.
+                    format: int32
+                    maximum: 50
+                    minimum: 0
+                    type: integer
+                required:
+                - enabled
+                type: object
+              admissionControl:
+                description: |-
+                  AdmissionControl is the baseline config for the success-rate shedding
+                  filter. Profile overrides take precedence when a profile is active.
+                  Omit to disable this filter entirely.
+                properties:
+                  enabled:
+                    default: true
+                    description: Enabled toggles the filter. When false, the EnvoyFilter
+                      is deleted.
+                    type: boolean
+                  maxRejectionPercent:
+                    default: "80.0"
+                    description: |-
+                      MaxRejectionPercent is the hard cap on rejection rate.
+                      Never reject more than this percentage regardless of degradation.
+                      Non-negotiable safety valve. Do not set above 95.
+                      Must be a decimal string between "0.0" and "95.0".
+                    pattern: ^([0-9]|[1-8][0-9]|9[0-5])(\.\d+)?$
+                    type: string
+                  minRequestsPerSecond:
+                    default: 5
+                    description: |-
+                      MinRequestsPerSecond is the minimum RPS below which the filter is inactive.
+                      Prevents false positives during cold start and very low traffic.
+                    format: int32
+                    maximum: 10000
+                    minimum: 0
+                    type: integer
+                  sheddingSpeed:
+                    default: "1.5"
+                    description: |-
+                      SheddingSpeed controls the shedding curve shape.
+                      1.0=linear, 1.5=moderate (recommended), 2.0=aggressive.
+                    type: string
+                  successCodes:
+                    description: |-
+                      SuccessCodes defines which HTTP status codes count as success.
+                      Defaults to 1xx-3xx (100-399) if not specified.
+                      gRPC status 0 (OK) is always counted as success.
+                    items:
+                      description: HTTPStatusRange is an inclusive range of HTTP status
+                        codes.
+                      properties:
+                        end:
+                          format: int32
+                          maximum: 599
+                          minimum: 100
+                          type: integer
+                        start:
+                          format: int32
+                          maximum: 599
+                          minimum: 100
+                          type: integer
+                      required:
+                      - end
+                      - start
+                      type: object
+                    type: array
+                  successRateThreshold:
+                    default: "95.0"
+                    description: |-
+                      SuccessRateThreshold is the success rate below which shedding begins.
+                      "95.0" means: start shedding when fewer than 95% of requests succeed.
+                      Profiles override this field when active.
+                    type: string
+                  successRateWindow:
+                    default: 30s
+                    description: SuccessRateWindow is the rolling window for success/failure
+                      history.
+                    type: string
+                required:
+                - enabled
+                type: object
+              dryRun:
+                default: false
+                description: |-
+                  DryRun installs filters but configures them to never reject any requests.
+                  All other behaviour (status updates, metrics, trigger evaluation) works
+                  normally — you see what would have happened without any enforcement.
+
+                  This is the recommended first step for every new AdaptivePolicy:
+                   1. Deploy with dryRun: true for 2+ weeks
+                   2. Watch status.lastDecision and status.wouldHaveShedRate
+                   3. Tune profiles and triggers until they look sensible
+                   4. Set dryRun: false to enable enforcement
+                type: boolean
+              meshBackend:
+                allOf:
+                - enum:
+                  - auto
+                  - istio
+                  - cilium
+                - enum:
+                  - auto
+                  - istio
+                  - cilium
+                default: auto
+                description: MeshBackend selects which mesh to target. "auto" recommended.
+                type: string
+              meshMode:
+                allOf:
+                - enum:
+                  - sidecar
+                  - ambient
+                - enum:
+                  - sidecar
+                  - ambient
+                default: sidecar
+                description: MeshMode is the Istio data plane mode. Only relevant
+                  for Istio.
+                type: string
+              profiles:
+                additionalProperties:
+                  description: |-
+                    ProfileConfig is a named resilience configuration.
+                    Profiles are defined by humans in the spec and switched by triggers or
+                    schedules. The brain (v2) executes these profiles — it does not create them.
+
+                    When a profile is active, its fields override the corresponding fields in
+                    the top-level adaptiveConcurrency and admissionControl config.
+                    Fields not specified in the profile inherit from the top-level config.
+                  properties:
+                    adaptiveConcurrency:
+                      description: |-
+                        AdaptiveConcurrency overrides for this profile.
+                        Only specified fields are overridden — unspecified fields inherit.
+                      properties:
+                        latencyPercentile:
+                          allOf:
+                          - enum:
+                            - p50
+                            - p75
+                            - p90
+                            - p99
+                          - enum:
+                            - p50
+                            - p75
+                            - p90
+                            - p99
+                          description: |-
+                            LatencyPercentile overrides the gradient baseline percentile.
+                            Typical degraded profile: p75 (more conservative than normal p50).
+                          type: string
+                      type: object
+                    admissionControl:
+                      description: |-
+                        AdmissionControl overrides for this profile.
+                        Only specified fields are overridden — unspecified fields inherit.
+                      properties:
+                        sheddingSpeed:
+                          description: |-
+                            SheddingSpeed overrides the shedding curve. Higher = sheds faster.
+                            Typical degraded profile: "2.0". Critical profile: "3.0".
+                          type: string
+                        successRateThreshold:
+                          description: |-
+                            SuccessRateThreshold overrides the shedding trigger threshold.
+                            Lower = more aggressive shedding. Typical degraded profile: "85.0".
+                          type: string
+                        successRateWindow:
+                          description: |-
+                            SuccessRateWindow overrides the rolling history window.
+                            Shorter = reacts faster. Typical degraded profile: "20s".
+                          type: string
+                      type: object
+                  type: object
+                description: |-
+                  Profiles are named resilience configurations defined by platform engineers.
+                  Each profile overrides specific fields from the baseline AdmissionControl
+                  and AdaptiveConcurrency config when active.
+
+                  Recommended profiles:
+                    normal:     baseline — matches top-level config
+                    degraded:   tighter thresholds for traffic spikes
+                    critical:   most aggressive shedding for severe degradation
+                    flash-sale: pre-armed for known high-traffic events
+                type: object
+              schedules:
+                description: |-
+                  Schedules define time-based profile switches for known events.
+                  Proactive — fires before traffic arrives, not after.
+                items:
+                  description: |-
+                    ScheduleConfig defines a time-based profile switch.
+
+                    Schedules are proactive — they fire before traffic arrives, not after.
+                    This is the correct mechanism for known events: flash sales, deployments,
+                    batch jobs, marketing campaigns.
+
+                    The schedule runs regardless of current service health. If the service is
+                    already in a degraded profile, the schedule switch still fires. Design
+                    schedules with this in mind — use fromProfiles if needed.
+                  properties:
+                    cron:
+                      description: |-
+                        Cron is the schedule expression (standard 5-field cron).
+                        Example: "50 13 * * 5" = Friday 1:50 PM (10 min before a 2 PM sale).
+                        Times are in UTC.
+                      minLength: 9
+                      type: string
+                    fromProfiles:
+                      description: |-
+                        FromProfiles limits this schedule to only fire when in one of the
+                        listed profiles. Empty means fire from any profile.
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      description: Name is a unique identifier for this schedule.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    switchTo:
+                      description: |-
+                        SwitchTo is the profile to activate at the scheduled time.
+                        Must match a key in spec.profiles.
+                      minLength: 1
+                      type: string
+                  required:
+                  - cron
+                  - name
+                  - switchTo
+                  type: object
+                type: array
+              selector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Selector matches the pods this policy applies to.
+                  Rendered as workloadSelector.labels on generated EnvoyFilter resources.
+                  Must not be empty — an empty selector matches all pods in the namespace.
+                minProperties: 1
+                type: object
+              signalConfig:
+                description: SignalConfig controls how the controller reads metrics
+                  for trigger evaluation.
+                properties:
+                  capacityWarningPercent:
+                    default: 10
+                    description: |-
+                      CapacityWarningPercent is the percentage of time the service
+                      must be in a non-normal profile before a ScalabilityWarning condition
+                      fires. This signals a capacity problem, not a traffic spike problem.
+                      0 disables scalability warnings.
+                      Example: 10 means "warn if shedding more than 10% of the time over 7 days."
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  capacityWarningWindowDays:
+                    default: 7
+                    description: CapacityWarningWindowDays is the rolling window for
+                      scalability warning.
+                    format: int32
+                    maximum: 30
+                    minimum: 1
+                    type: integer
+                  evaluationIntervalSeconds:
+                    default: 30
+                    description: |-
+                      EvaluationIntervalSeconds is how often signals are evaluated against triggers.
+                      Lower = reacts faster but uses more resources. Minimum 5s.
+                    format: int32
+                    maximum: 300
+                    minimum: 5
+                    type: integer
+                  metricsEndpoint:
+                    description: |-
+                      MetricsEndpoint is the Prometheus endpoint to query for trigger evaluation.
+                      In Istio, this is typically the Envoy stats endpoint exposed at
+                      http://<pod-ip>:15090/stats/prometheus — available without a cluster-level
+                      Prometheus installation.
+                      Defaults to the Istio sidecar stats endpoint (auto-discovered by pod IP).
+                    type: string
+                type: object
+              streamingProtection:
+                description: |-
+                  StreamingProtection provides connection-level limits for gRPC streaming
+                  and WebSocket connections. Rendered as DestinationRule.connectionPool.
+                  Omit to disable streaming protection.
+                properties:
+                  enabled:
+                    default: true
+                    description: |-
+                      Enabled toggles streaming protection. When false, no DestinationRule
+                      is rendered for this policy.
+                    type: boolean
+                  maxConcurrentStreams:
+                    default: 200
+                    description: |-
+                      MaxConcurrentStreams is the maximum concurrent active streams.
+                      Maps to DestinationRule.connectionPool.http.http2MaxRequests.
+                    format: int32
+                    maximum: 100000
+                    minimum: 1
+                    type: integer
+                  maxPendingRequests:
+                    default: 1024
+                    description: |-
+                      MaxPendingRequests is the queue size before immediate 503.
+                      Maps to DestinationRule.connectionPool.http.http1MaxPendingRequests.
+                    format: int32
+                    maximum: 100000
+                    minimum: 1
+                    type: integer
+                  streamTimeoutSeconds:
+                    default: 300
+                    description: |-
+                      StreamTimeoutSeconds is the maximum stream duration before force-close.
+                      Prevents stalled streams from holding connection slots indefinitely.
+                      Maps to DestinationRule.connectionPool.http.idleTimeout.
+                    format: int32
+                    maximum: 86400
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                type: object
+              triggers:
+                description: |-
+                  Triggers define conditions that automatically switch the active profile.
+                  Evaluated every signalConfig.evaluationIntervalSeconds against live metrics.
+                  Triggers fire in order — first matching trigger wins.
+                items:
+                  description: "TriggerConfig defines a condition that switches the
+                    active profile.\n\nTriggers are evaluated by the controller (v1:
+                    against Prometheus metrics\nvia a configurable scrape endpoint)
+                    or by the v2 brain (against OTLP traces\nwith causal attribution).
+                    The evaluation mechanism changes between versions\nbut the trigger
+                    spec is identical.\n\nExample:\n\n\tname: degradation-detected\n\twhen:\n\t
+                    \ successRate: {below: 0.90, consecutiveSamples: 2}\n\tswitchTo:
+                    degraded"
+                  properties:
+                    cooldownSeconds:
+                      default: 60
+                      description: |-
+                        CooldownSeconds is the minimum seconds between consecutive firings
+                        of this trigger. Prevents rapid oscillation between profiles.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    fromProfiles:
+                      description: |-
+                        FromProfiles limits this trigger to only fire when currently in one of
+                        the listed profiles. Empty means fire from any profile.
+                        Useful for recovery triggers: only recover if currently in degraded/critical.
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      description: |-
+                        Name is a unique identifier for this trigger.
+                        Used in status, events, and log output to identify which trigger fired.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+                      type: string
+                    switchTo:
+                      description: |-
+                        SwitchTo is the profile name to activate when conditions are met.
+                        Must match a key in spec.profiles.
+                      minLength: 1
+                      type: string
+                    when:
+                      description: When defines the conditions that must be met to
+                        fire this trigger.
+                      properties:
+                        rpsAbove:
+                          description: |-
+                            RPSAbove triggers when requests per second exceeds a threshold.
+                            Useful for flash-sale pre-arming via RPS as a leading indicator.
+                          format: int32
+                          type: integer
+                        serviceLatencyMs:
+                          description: |-
+                            ServiceLatencyMs triggers based on the service's own processing
+                            latency — excluding downstream dependency time. Requires v2 brain
+                            with OTLP traces for causal attribution. In v1, this falls back to
+                            total request latency from Prometheus.
+                          properties:
+                            above:
+                              description: |-
+                                Above triggers when the value exceeds this threshold.
+                                Example: "500.0" triggers when latency exceeds 500ms.
+                              pattern: ^\d+(\.\d+)?$
+                              type: string
+                            below:
+                              description: Below triggers when the value falls below
+                                this threshold.
+                              pattern: ^\d+(\.\d+)?$
+                              type: string
+                            consecutiveSamples:
+                              default: 2
+                              description: ConsecutiveSamples required before the
+                                trigger fires.
+                              format: int32
+                              maximum: 10
+                              minimum: 1
+                              type: integer
+                          type: object
+                        successRate:
+                          description: SuccessRate triggers based on the request success
+                            rate (0.0-1.0).
+                          properties:
+                            above:
+                              description: |-
+                                Above triggers when the rate rises above this value.
+                                Example: "0.97" fires when more than 97% of requests succeed.
+                              pattern: ^(0(\.\d{1,4})?|1(\.0{1,4})?)$
+                              type: string
+                            below:
+                              description: |-
+                                Below triggers when the rate falls below this value.
+                                Example: "0.90" fires when less than 90% of requests succeed.
+                              pattern: ^(0(\.\d{1,4})?|1(\.0{1,4})?)$
+                              type: string
+                            consecutiveSamples:
+                              default: 2
+                              description: |-
+                                ConsecutiveSamples is how many consecutive evaluations must meet the
+                                condition before the trigger fires. Minimum 1.
+                              format: int32
+                              maximum: 10
+                              minimum: 1
+                              type: integer
+                          type: object
+                      type: object
+                  required:
+                  - name
+                  - switchTo
+                  - when
+                  type: object
+                type: array
+            required:
+            - selector
+            type: object
+          status:
+            description: |-
+              AdaptivePolicyStatus reflects the observed state of an AdaptivePolicy.
+              Designed for 3am readability — one kubectl describe answers all questions.
+            properties:
+              activeFilters:
+                description: |-
+                  ActiveFilters lists Envoy filter names currently installed.
+                  Example: ["admission-control", "adaptive-concurrency", "streaming-protection"]
+                items:
+                  type: string
+                type: array
+              activeProfile:
+                description: |-
+                  ActiveProfile is the profile currently being enforced.
+                  Empty means baseline config is active (normal operation).
+                type: string
+              conditions:
+                description: Conditions summarise reconciliation state using standard
+                  K8s conventions.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              consecutiveBadSamples:
+                description: |-
+                  ConsecutiveBadSamples tracks how many consecutive evaluations have met
+                  degradation conditions. Counts toward consecutiveSamples in triggers.
+                  Useful for understanding how close to a trigger firing the service is.
+                format: int32
+                type: integer
+              decisionHistory:
+                description: |-
+                  DecisionHistory contains the last 10 decisions in reverse chronological order.
+                  Provides full incident context without needing to query logs.
+                items:
+                  description: |-
+                    DecisionRecord is a single recorded decision — what the controller decided,
+                    when, why, and what happened afterwards. This is the primary 3am interface:
+                    one kubectl describe tells the complete story.
+                  properties:
+                    deliveryLatencyMs:
+                      description: DeliveryLatencyMs is how long the delivery took
+                        in milliseconds.
+                      format: int64
+                      type: integer
+                    deliveryMethod:
+                      description: |-
+                        DeliveryMethod is how the profile switch was delivered.
+                        "rtds" for sub-200ms delivery, "envoyfilter" for standard xDS path.
+                      type: string
+                    outcome:
+                      description: |-
+                        Outcome is what happened after this decision (set 5 minutes later).
+                        "service_recovered" | "partially_recovered" | "no_change" |
+                        "over_shed" | "worsened" | "pending"
+                      type: string
+                    outcomeDetail:
+                      description: |-
+                        OutcomeDetail is a human-readable explanation of the outcome.
+                        Example: "success rate returned to 97.2% within 4 minutes"
+                      type: string
+                    profileAfter:
+                      description: ProfileAfter is the profile switched to.
+                      type: string
+                    profileBefore:
+                      description: ProfileBefore is the profile that was active before
+                        this switch.
+                      type: string
+                    scheduleName:
+                      description: ScheduleName is which schedule fired (empty for
+                        trigger or manual switch).
+                      type: string
+                    signalValues:
+                      description: |-
+                        SignalValues are the metric values that caused this decision.
+                        Written in plain English for 3am readability.
+                        Example: "successRate=0.882 (below 0.90 for 2 consecutive samples)"
+                      type: string
+                    timestamp:
+                      description: Timestamp when this decision was made.
+                      format: date-time
+                      type: string
+                    triggerName:
+                      description: TriggerName is which trigger fired (empty for schedule
+                        or manual switch).
+                      type: string
+                  required:
+                  - deliveryMethod
+                  - profileAfter
+                  - profileBefore
+                  - signalValues
+                  - timestamp
+                  type: object
+                type: array
+              detectedBackend:
+                description: |-
+                  DetectedBackend is the mesh the controller is rendering resources for.
+                  "istio" | "cilium" | "none"
+                type: string
+              lastDecision:
+                description: |-
+                  LastDecision is the most recent profile switch decision.
+                  Contains full reasoning, signal values, delivery latency, and outcome.
+                  This is the first thing to read during an incident.
+                properties:
+                  deliveryLatencyMs:
+                    description: DeliveryLatencyMs is how long the delivery took in
+                      milliseconds.
+                    format: int64
+                    type: integer
+                  deliveryMethod:
+                    description: |-
+                      DeliveryMethod is how the profile switch was delivered.
+                      "rtds" for sub-200ms delivery, "envoyfilter" for standard xDS path.
+                    type: string
+                  outcome:
+                    description: |-
+                      Outcome is what happened after this decision (set 5 minutes later).
+                      "service_recovered" | "partially_recovered" | "no_change" |
+                      "over_shed" | "worsened" | "pending"
+                    type: string
+                  outcomeDetail:
+                    description: |-
+                      OutcomeDetail is a human-readable explanation of the outcome.
+                      Example: "success rate returned to 97.2% within 4 minutes"
+                    type: string
+                  profileAfter:
+                    description: ProfileAfter is the profile switched to.
+                    type: string
+                  profileBefore:
+                    description: ProfileBefore is the profile that was active before
+                      this switch.
+                    type: string
+                  scheduleName:
+                    description: ScheduleName is which schedule fired (empty for trigger
+                      or manual switch).
+                    type: string
+                  signalValues:
+                    description: |-
+                      SignalValues are the metric values that caused this decision.
+                      Written in plain English for 3am readability.
+                      Example: "successRate=0.882 (below 0.90 for 2 consecutive samples)"
+                    type: string
+                  timestamp:
+                    description: Timestamp when this decision was made.
+                    format: date-time
+                    type: string
+                  triggerName:
+                    description: TriggerName is which trigger fired (empty for schedule
+                      or manual switch).
+                    type: string
+                required:
+                - deliveryMethod
+                - profileAfter
+                - profileBefore
+                - signalValues
+                - timestamp
+                type: object
+              lastReconcileTime:
+                description: |-
+                  LastReconcileTime is when the controller last successfully reconciled.
+                  Used to detect stale/stuck reconciliation.
+                format: date-time
+                type: string
+              managedResources:
+                description: |-
+                  ManagedResources lists all resources this policy has created.
+                  All are owned by this AdaptivePolicy and cascade-deleted with it.
+                items:
+                  description: ManagedResource is a Kubernetes resource owned by this
+                    policy.
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  - namespace
+                  type: object
+                type: array
+              nextTriggerEvaluation:
+                description: NextTriggerEvaluation is when the next trigger evaluation
+                  will run.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation last reconciled.
+                  If ObservedGeneration < metadata.generation, controller has not
+                  processed the latest spec change yet.
+                format: int64
+                type: integer
+              profileActiveSince:
+                description: ProfileActiveSince is when the current profile was switched
+                  to.
+                format: date-time
+                type: string
+              rtdsConnected:
+                description: |-
+                  RTDSConnected indicates whether the RTDS gRPC stream to Istiod is active.
+                  When false, profile switches fall back to the EnvoyFilter path (slower).
+                type: boolean
+              scalabilityWarning:
+                description: |-
+                  ScalabilityWarning is set when the service has been shedding load for
+                  too long — indicating a capacity problem rather than a traffic spike.
+                  When true: consider permanently scaling up the service rather than
+                  relying on load shedding as an ongoing strategy.
+                type: boolean
+              scalabilityWarningDetail:
+                description: |-
+                  ScalabilityWarningDetail explains why the scalability warning fired.
+                  Example: "service was in non-normal profile for 18% of the last 7 days
+                  (threshold: 10%). This suggests sustained capacity insufficiency."
+                type: string
+              shedRateNow:
+                description: |-
+                  ShedRateNow is the approximate percentage of inbound requests currently
+                  being rejected by the admission control filter.
+                  "0%" = no shedding. "unknown" = metrics unavailable.
+                  Approximation only — do not alert on this field.
+                type: string
+              wouldHaveShedRate:
+                description: |-
+                  WouldHaveShedRate is what the shed rate would be in dryRun=false.
+                  Only populated when dryRun=true. Shows what enforcement would look like
+                  before you enable it. This is the primary dryRun observation tool.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

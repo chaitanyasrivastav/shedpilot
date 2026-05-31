@@ -1,0 +1,9 @@
+apiVersion: resilience.shedpilot.io/v1alpha1
+kind: AdaptivePolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: shedpilot
+    app.kubernetes.io/managed-by: kustomize
+  name: adaptivepolicy-sample
+spec:
+  # TODO(user): Add fields here

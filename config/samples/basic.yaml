@@ -1,0 +1,162 @@
+# basic.yaml — simplest useful policy with profiles
+#
+# Step 1: Apply with dryRun: true — observe for 2 weeks, nothing is rejected
+#   kubectl apply -f config/samples/basic.yaml
+#
+# Step 2: Watch what would happen
+#   kubectl describe adaptivepolicy payments
+#
+# Step 3: Enable enforcement
+#   kubectl patch adaptivepolicy payments --type merge -p '{"spec":{"dryRun":false}}'
+#
+# Escape hatches:
+#   Freeze:  kubectl annotate adaptivepolicy payments shedpilot.io/human-override=true
+#   Remove:  kubectl delete adaptivepolicy payments  (cascade deletes all EnvoyFilters)
+apiVersion: resilience.shedpilot.io/v1alpha1
+kind: AdaptivePolicy
+metadata:
+  name: payments
+  namespace: default
+spec:
+  selector:
+    app: payments             # matches pods with label app=payments
+
+  dryRun: true                # observe only — never rejects any requests
+  meshBackend: auto           # auto-detects Istio or Cilium
+
+  # ── Baseline filter config ──────────────────────────────────────────────────
+  # Active when no profile is explicitly set.
+  # Profile overrides layer on top of these values.
+
+  admissionControl:
+    enabled: true
+    successRateThreshold: "95.0"  # shed when <95% of requests succeed
+    sheddingSpeed: "1.5"             # shedding curve: 1.0=gentle, 1.5=moderate, 2.0=aggressive
+    maxRejectionPercent: "80.0"   # hard cap — always let some traffic through
+
+  adaptiveConcurrency:
+    enabled: true
+    latencyPercentile: p50         # gradient baseline — p50 recommended for most services
+    latencyBaselineInterval: 60s           # how often to recalculate baseline latency
+    concurrencyAdjustInterval: 100ms         # how often to adjust concurrency limit
+
+  # ── Profiles ────────────────────────────────────────────────────────────────
+  # Named configurations you switch between. Each profile only specifies
+  # what changes from the baseline above — everything else inherits.
+  #
+  # Think of these as your runbook, encoded in YAML.
+  # normal    → healthy service, baseline protection
+  # degraded  → service struggling, tighten the gates
+  # critical  → service barely alive, protect at all costs
+  # flash-sale → pre-armed for known high-traffic events
+
+  profiles:
+
+    normal:
+      # Baseline behaviour — matches top-level config above.
+      # Explicit here so triggers have a named target to return to.
+      admissionControl:
+        successRateThreshold: "95.0"
+        sheddingSpeed: "1.5"
+
+    degraded:
+      # Activated when success rate drops below 90%.
+      # Tighter threshold + faster reaction protects the service
+      # while autoscaling provisions new capacity (2-5 min gap).
+      admissionControl:
+        successRateThreshold: "85.0"  # shed when <85% succeed (was 95%)
+        sheddingSpeed: "2.0"             # sharper shedding curve
+        successRateWindow: "20s"  # shorter window = reacts faster
+      adaptiveConcurrency:
+        latencyPercentile: p75         # more conservative baseline
+
+    critical:
+      # Activated when success rate drops below 80%.
+      # Aggressive shedding to keep the service alive at all.
+      # Some orders failing is better than all orders failing.
+      admissionControl:
+        successRateThreshold: "75.0"
+        sheddingSpeed: "3.0"
+        successRateWindow: "15s"
+
+    flash-sale:
+      # Pre-armed BEFORE a known event (via schedule below).
+      # Slightly tighter than normal — protective without being aggressive.
+      # Switch to this 10 minutes before the sale, not after it hits.
+      admissionControl:
+        successRateThreshold: "90.0"
+        sheddingSpeed: "1.8"
+        successRateWindow: "15s"  # react faster during high-traffic periods
+
+  # Which profile is active right now.
+  # Triggers and schedules switch this automatically.
+  # Or switch manually: kubectl patch adaptivepolicy payments \
+  #   --type merge -p '{"spec":{"activeProfile":"degraded"}}'
+  activeProfile: normal
+
+  # ── Triggers ────────────────────────────────────────────────────────────────
+  # Conditions that automatically switch profiles.
+  # Evaluated every 30s (configurable via signalConfig.scrapeIntervalSeconds).
+  # First matching trigger wins. consecutiveSamples prevents false positives.
+
+  triggers:
+
+    # Switch to degraded when success rate drops below 90%
+    # Requires 2 consecutive bad readings — ignores transient blips
+  - name: degradation-detected
+    when:
+      successRate:
+        below: "0.90"
+        consecutiveSamples: 2
+    switchTo: degraded
+    cooldownSeconds: 60           # don't re-fire for 60s after switching
+
+    # Escalate to critical when success rate drops below 80%
+  - name: critical-degradation
+    when:
+      successRate:
+        below: "0.80"
+        consecutiveSamples: 2
+    switchTo: critical
+    cooldownSeconds: 60
+
+    # Recover to normal — only fires when currently degraded or critical
+    # Requires 3 consecutive good readings before restoring
+    # (more confirmation needed to recover than to degrade)
+  - name: recovery
+    when:
+      successRate:
+        above: "0.97"
+        consecutiveSamples: 3
+    fromProfiles:
+      - degraded
+      - critical
+    switchTo: normal
+    cooldownSeconds: 120
+
+  # ── Schedules ────────────────────────────────────────────────────────────────
+  # Proactive switches for known events — fires BEFORE traffic arrives.
+  # This is the key advantage over purely reactive tools.
+  # Times are UTC.
+
+  schedules:
+
+    # Pre-arm 10 minutes before Friday 2pm flash sale
+  - name: friday-flash-sale-start
+    cron: "50 13 * * 5"           # Friday 1:50 PM UTC
+    switchTo: flash-sale
+
+    # Restore 90 minutes after sale ends
+    # fromProfiles: only restore if still in flash-sale
+    # (don't override if we degraded during the sale)
+  - name: friday-flash-sale-end
+    cron: "30 15 * * 5"           # Friday 3:30 PM UTC
+    switchTo: normal
+    fromProfiles:
+      - flash-sale
+
+  # ── Signal config ─────────────────────────────────────────────────────────
+  signalConfig:
+    evaluationIntervalSeconds: 30           # evaluate triggers every 30s
+    capacityWarningPercent: 10  # warn if shedding >10% of time over 7 days
+    capacityWarningWindowDays: 7     # if this fires, you need more capacity not shedpilot
