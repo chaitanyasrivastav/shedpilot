@@ -9,7 +9,7 @@ spec:
   group: resilience.shedpilot.io
   names:
     categories:
-    - adaptive-mesh
+    - shedpilot
     kind: AdaptivePolicy
     listKind: AdaptivePolicyList
     plural: adaptivepolicies
@@ -54,7 +54,7 @@ spec:
           \"85.0\", sheddingSpeed: \"2.0\"}\n\t  triggers:\n\t  - name: degradation-detected\n\t
           \   when: {successRate: {below: 0.90, consecutiveSamples: 2}}\n\t    switchTo:
           degraded\n\nEscape hatches:\n\n\t# Freeze brain patches (keep enforcement
-          running):\n\tkubectl annotate adaptivepolicy payments adaptive-mesh.io/human-override=true\n\n\t#
+          running):\n\tkubectl annotate adaptivepolicy payments shedpilot.io/human-override=true\n\n\t#
           Observe only (keep filters installed, disable rejection):\n\tkubectl patch
           adaptivepolicy payments --type merge -p '{\"spec\":{\"dryRun\":true}}'\n\n\t#
           Remove everything (cascade deletes all EnvoyFilters):\n\tkubectl delete

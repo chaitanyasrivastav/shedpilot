@@ -57,7 +57,7 @@ func main() {
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
-		LeaderElectionID:       "shedpilot.resilience.meshpilot.io",
+		LeaderElectionID:       "shedpilot.resilience.shedpilot.io",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")

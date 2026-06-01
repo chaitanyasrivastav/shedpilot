@@ -12,29 +12,23 @@ import (
 // DetectAndBuild auto-detects the mesh backend and returns the correct
 // Renderer implementation. Detection runs in priority order:
 //
-//  1. Istio — checks for istiod pod in istio-system
-//  2. Cilium — checks for cilium-envoy DaemonSet in kube-system (v1.1)
-//  3. Error — surfaces as MeshDetected=False condition on the CRD
+//  1. Istio  — checks for istiod pod in istio-system
+//  2. Cilium — checks for cilium-envoy DaemonSet in kube-system
+//  3. Error  — surfaces as MeshDetected=False condition on the CRD
 //
-// If the policy specifies an explicit meshBackend, detection is skipped
-// and that backend is used directly.
+// If the policy specifies an explicit meshBackend, detection is skipped.
 func DetectAndBuild(
 	ctx context.Context,
 	c client.Client,
 	policy *v1alpha1.AdaptivePolicy,
 ) (Renderer, error) {
 
-	backend := policy.EffectiveMeshBackend()
-
-	switch backend {
+	switch policy.EffectiveMeshBackend() {
 	case v1alpha1.MeshBackendIstio:
 		return NewIstioRenderer(), nil
 
 	case v1alpha1.MeshBackendCilium:
-		return nil, fmt.Errorf(
-			"cilium backend is not yet implemented (v1.1 roadmap). " +
-				"Set meshBackend: istio or meshBackend: auto to use Istio",
-		)
+		return NewCiliumRenderer(), nil
 
 	default: // MeshBackendAuto
 		return detect(ctx, c)
@@ -42,16 +36,16 @@ func DetectAndBuild(
 }
 
 // detect runs auto-detection in priority order.
+// Istio is checked first — if both are present, Istio wins.
 func detect(ctx context.Context, c client.Client) (Renderer, error) {
 	renderers := []Renderer{
 		NewIstioRenderer(),
-		// NewCiliumRenderer() — add in v1.1
+		NewCiliumRenderer(),
 	}
 
 	for _, r := range renderers {
 		found, err := r.Detect(ctx, c)
 		if err != nil {
-			// Non-fatal — log and try next
 			continue
 		}
 		if found {
@@ -60,8 +54,9 @@ func detect(ctx context.Context, c client.Client) (Renderer, error) {
 	}
 
 	return nil, fmt.Errorf(
-		"no supported service mesh detected in the cluster. " +
-			"Supported meshes: Istio (istiod pod in istio-system). " +
+		"no supported service mesh detected. " +
+			"Supported: Istio (istiod pod in istio-system), " +
+			"Cilium (cilium-envoy DaemonSet in kube-system). " +
 			"Set meshBackend explicitly if detection is incorrect",
 	)
 }

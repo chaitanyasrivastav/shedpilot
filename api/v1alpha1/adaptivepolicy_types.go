@@ -54,34 +54,34 @@ const (
 	// AnnotationHumanOverride when "true" prevents the v2 brain from patching
 	// any spec fields. The controller still reconciles. Envoy still enforces.
 	// Set during incidents to freeze thresholds immediately.
-	AnnotationHumanOverride = "adaptive-mesh.io/human-override"
+	AnnotationHumanOverride = "shedpilot.io/human-override"
 
 	// AnnotationLastReason records why the last spec change was made.
 	// Written by the v2 brain. Read during incident review.
-	AnnotationLastReason = "adaptive-mesh.io/last-reason"
+	AnnotationLastReason = "shedpilot.io/last-reason"
 
 	// AnnotationLastActionTime is the RFC3339 timestamp of the last brain patch.
-	AnnotationLastActionTime = "adaptive-mesh.io/last-action-time"
+	AnnotationLastActionTime = "shedpilot.io/last-action-time"
 
 	// AnnotationPreviousProfile records the profile active before the last switch.
-	AnnotationPreviousProfile = "adaptive-mesh.io/previous-profile"
+	AnnotationPreviousProfile = "shedpilot.io/previous-profile"
 
 	// AnnotationManagedBy identifies what last modified thresholds.
 	// e.g. "adaptive-runtime/v0.3.1" or "human"
-	AnnotationManagedBy = "adaptive-mesh.io/managed-by"
+	AnnotationManagedBy = "shedpilot.io/managed-by"
 
 	// AnnotationIncidentStart records when degradation was first detected.
-	AnnotationIncidentStart = "adaptive-mesh.io/incident-start"
+	AnnotationIncidentStart = "shedpilot.io/incident-start"
 
 	// AnnotationIncidentDuration records how long the last incident lasted.
-	AnnotationIncidentDuration = "adaptive-mesh.io/incident-duration"
+	AnnotationIncidentDuration = "shedpilot.io/incident-duration"
 
 	// AnnotationPeakRejectionRate records peak shed rate during last incident.
-	AnnotationPeakRejectionRate = "adaptive-mesh.io/peak-rejection-rate"
+	AnnotationPeakRejectionRate = "shedpilot.io/peak-rejection-rate"
 
 	// AnnotationBrainMode is the current operating mode of the v2 brain.
 	// observe | assisted | autonomous — set by the brain, read by the controller.
-	AnnotationBrainMode = "adaptive-mesh.io/brain-mode"
+	AnnotationBrainMode = "shedpilot.io/brain-mode"
 )
 
 // ─── Condition types ─────────────────────────────────────────────────────────
@@ -828,7 +828,7 @@ type AdaptivePolicyStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=ap,scope=Namespaced,categories=adaptive-mesh
+// +kubebuilder:resource:shortName=ap,scope=Namespaced,categories=shedpilot
 // +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=`.status.detectedBackend`
 // +kubebuilder:printcolumn:name="Profile",type=string,JSONPath=`.status.activeProfile`
 // +kubebuilder:printcolumn:name="DryRun",type=boolean,JSONPath=`.spec.dryRun`
@@ -867,7 +867,7 @@ type AdaptivePolicyStatus struct {
 // Escape hatches:
 //
 //	# Freeze brain patches (keep enforcement running):
-//	kubectl annotate adaptivepolicy payments adaptive-mesh.io/human-override=true
+//	kubectl annotate adaptivepolicy payments shedpilot.io/human-override=true
 //
 //	# Observe only (keep filters installed, disable rejection):
 //	kubectl patch adaptivepolicy payments --type merge -p '{"spec":{"dryRun":true}}'

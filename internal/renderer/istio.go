@@ -27,16 +27,16 @@ const (
 
 	// RTDS runtime keys — these match the runtime_key fields in the filter config.
 	// Changing these values via RTDS updates filter behaviour without re-rendering.
-	rtdsKeyAdmissionEnabled       = "admission_control.enabled"
-	rtdsKeyAdmissionThreshold     = "admission_control.sr_threshold"
-	rtdsKeyAdmissionSheddingSpeed = "admission_control.sheddingSpeed"
-	rtdsKeyConcurrencyEnabled     = "adaptive_concurrency.enabled"
+	rtdsKeyAdmissionEnabled    = "admission_control.enabled"
+	rtdsKeyAdmissionThreshold  = "admission_control.sr_threshold"
+	rtdsKeyAdmissionAggression = "admission_control.aggression"
+	rtdsKeyConcurrencyEnabled  = "adaptive_concurrency.enabled"
 
 	// Label keys on generated resources
 	labelManagedBy    = "app.kubernetes.io/managed-by"
 	labelManagedByVal = "shedpilot"
-	labelPolicy       = "resilience.meshpilot.io/policy"
-	labelPolicyNS     = "resilience.meshpilot.io/policy-namespace"
+	labelPolicy       = "resilience.shedpilot.io/policy"
+	labelPolicyNS     = "resilience.shedpilot.io/policy-namespace"
 )
 
 // IstioRenderer generates EnvoyFilter and DestinationRule resources for Istio.
@@ -99,7 +99,7 @@ func (r *IstioRenderer) Render(policy *v1alpha1.AdaptivePolicy) (*RenderResult, 
 			Name:       admissionControlName(policy),
 			Namespace:  policy.Namespace,
 		})
-		layerName := fmt.Sprintf("adaptive-mesh-%s-admission-control", policy.Name)
+		layerName := fmt.Sprintf("shedpilot-%s-admission-control", policy.Name)
 		result.RTDSLayers[layerName] = rtds
 	}
 
@@ -117,7 +117,7 @@ func (r *IstioRenderer) Render(policy *v1alpha1.AdaptivePolicy) (*RenderResult, 
 			Name:       adaptiveConcurrencyName(policy),
 			Namespace:  policy.Namespace,
 		})
-		layerName := fmt.Sprintf("adaptive-mesh-%s-adaptive-concurrency", policy.Name)
+		layerName := fmt.Sprintf("shedpilot-%s-adaptive-concurrency", policy.Name)
 		result.RTDSLayers[layerName] = rtds
 	}
 
@@ -194,7 +194,7 @@ func (r *IstioRenderer) renderAdmissionControl(
 		},
 		"sheddingSpeed": map[string]interface{}{
 			"default_value": mustParseFloat(sheddingSpeed),
-			"runtime_key":   rtdsKeyAdmissionSheddingSpeed,
+			"runtime_key":   rtdsKeyAdmissionAggression,
 		},
 		"rps_threshold": map[string]interface{}{
 			"default_value": int64(cfg.MinRequestsPerSecond),
@@ -226,9 +226,9 @@ func (r *IstioRenderer) renderAdmissionControl(
 	// RTDS layer — these keys can be updated at runtime without re-rendering
 	// the EnvoyFilter. Used for sub-200ms profile switching.
 	rtdsLayer := map[string]interface{}{
-		rtdsKeyAdmissionEnabled:       enabled,
-		rtdsKeyAdmissionThreshold:     mustParseFloat(threshold),
-		rtdsKeyAdmissionSheddingSpeed: mustParseFloat(sheddingSpeed),
+		rtdsKeyAdmissionEnabled:    enabled,
+		rtdsKeyAdmissionThreshold:  mustParseFloat(threshold),
+		rtdsKeyAdmissionAggression: mustParseFloat(sheddingSpeed),
 	}
 
 	return ef, rtdsLayer, nil
