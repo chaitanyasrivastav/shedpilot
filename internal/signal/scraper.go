@@ -6,20 +6,8 @@
 // in Istio sidecars. This endpoint is available without any cluster-level
 // Prometheus installation — it's just the sidecar itself.
 //
-// Scraping directly gives us:
-//   - Sub-second freshness (no Prometheus scrape interval lag)
-//   - Per-pod granularity (not aggregated across replicas)
-//   - Admission control filter counters (upstream_rq_total, upstream_rq_2xx)
-//   - Adaptive concurrency counters (gradient, limit, min_rtt)
-//
 // In v2, this scraper is replaced by the OTLP Collector processor which
 // provides trace-level signals with causal attribution.
-//
-// # How pod discovery works
-//
-// The scraper lists pods matching the AdaptivePolicy selector in the same
-// namespace. It scrapes each pod's Envoy stats endpoint and aggregates
-// across all replicas to compute fleet-wide success rate and RPS.
 package signal
 
 import (
@@ -30,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,83 +29,68 @@ import (
 )
 
 const (
-	// envoyStatsPort is the Istio sidecar Prometheus stats port.
-	// Envoy exposes metrics at http://<pod-ip>:15090/stats/prometheus
-	envoyStatsPort = 15090
+	envoyStatsPort    = 15090
+	statsPath         = "/stats/prometheus"
+	scrapeTimeout     = 3 * time.Second
+	maxStatsBodyBytes = 4 * 1024 * 1024 // 4 MiB — OOM guard
 
-	// statsPath is the Prometheus-format metrics endpoint on the sidecar.
-	statsPath = "/stats/prometheus"
-
-	// scrapeTimeout is the HTTP timeout for a single pod stats scrape.
-	// Must be short — we may scrape many pods per reconcile cycle.
-	scrapeTimeout = 3 * time.Second
-
-	// Envoy metric names we care about.
-	// These are emitted by Envoy's upstream cluster stats.
 	metricUpstreamRqTotal = "envoy_cluster_upstream_rq_total"
 	metricUpstreamRq2xx   = "envoy_cluster_upstream_rq_2xx"
 	metricUpstreamRq3xx   = "envoy_cluster_upstream_rq_3xx"
+	// 4xx IS tracked — whether it counts as success depends on policy.successCodes.
+	// Default successCodes is 100-399, so 4xx is a failure by default.
+	// But validation APIs that return 400 for bad input have a naturally low
+	// "success rate" under the hardcoded 2xx+3xx formula even when healthy.
+	// Tracking 4xx separately and applying successCodes config fixes this.
 	metricUpstreamRq4xx   = "envoy_cluster_upstream_rq_4xx"
 	metricUpstreamRq5xx   = "envoy_cluster_upstream_rq_5xx"
-
-	// Admission control filter metrics — emitted when the filter is active.
-	// These tell us how many requests the filter is actually shedding.
-	metricAdmissionRqShed  = "envoy_http_admission_control_requests_ejected"
-	metricAdmissionRqTotal = "envoy_http_admission_control_requests_total"
+	metricAdmissionRqShed = "envoy_http_admission_control_requests_ejected"
 )
 
 // Scraper reads signals from Envoy sidecar stats endpoints.
-// It maintains a counter history to compute per-interval rates (not cumulative).
+// All exported methods are safe for concurrent use.
 type Scraper struct {
-	// k8sClient for listing pods matching the policy selector.
-	k8sClient client.Client
-
-	// httpClient for scraping Envoy stats endpoints.
-	// Shared and reused — not created per scrape.
+	k8sClient  client.Client
 	httpClient *http.Client
-
-	// previous holds counter values from the last scrape per pod.
-	// Used to compute per-interval rates from cumulative counters.
-	// Key: pod name, Value: counter snapshot.
-	previous map[string]counterSnapshot
+	mu         sync.Mutex
+	previous   map[string]counterSnapshot
 }
 
-// counterSnapshot holds raw Envoy counter values from one scrape.
 type counterSnapshot struct {
 	rqTotal   float64
 	rq2xx     float64
 	rq3xx     float64
+	rq4xx     float64 // tracked for successCodes-aware calculation
 	rq5xx     float64
 	shedTotal float64
 	scrapedAt time.Time
 }
 
-// NewScraper creates a Scraper. The k8s client is used for pod discovery.
 func NewScraper(c client.Client) *Scraper {
 	return &Scraper{
 		k8sClient: c,
 		httpClient: &http.Client{
-			Timeout: scrapeTimeout,
-			// No redirects — Envoy stats don't redirect
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+			Timeout:       scrapeTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		previous: make(map[string]counterSnapshot),
 	}
 }
 
-// ReadSignals discovers pods matching the policy selector, scrapes each pod's
-// Envoy stats endpoint, and returns aggregated fleet-wide signals.
+// ReadSignals discovers pods, scrapes Envoy stats, returns fleet-wide signals.
 //
-// Returns safe defaults (99% success rate) if no pods are found or all
-// scrapes fail — this prevents false trigger fires during deployment rollouts.
+// Success rate respects policy.Spec.AdmissionControl.SuccessCodes — it measures
+// the same thing Envoy's admission_control filter measures. Without this, a
+// service with naturally high 4xx traffic (validation APIs) reads artificially
+// low success rate and triggers false profile switches.
 func (s *Scraper) ReadSignals(
 	ctx context.Context,
 	policy *v1alpha1.AdaptivePolicy,
 ) (trigger.Signals, error) {
 
-	// Discover pods matching the policy selector
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	pods, err := s.discoverPods(ctx, policy)
 	if err != nil {
 		return safeDefaults(), fmt.Errorf("pod discovery: %w", err)
@@ -126,25 +100,24 @@ func (s *Scraper) ReadSignals(
 			policy.Spec.Selector, policy.Namespace)
 	}
 
-	// Scrape all pods and aggregate
-	var totalRqDelta float64
-	var successDelta float64
-	var shedDelta float64
-	var scrapedPods int
+	// Use policy successCodes config — match what Envoy's filter counts.
+	// Default 100-399 if not configured.
+	successRanges := []v1alpha1.HTTPStatusRange{{Start: 100, End: 399}}
+	if policy.Spec.AdmissionControl != nil && len(policy.Spec.AdmissionControl.SuccessCodes) > 0 {
+		successRanges = policy.Spec.AdmissionControl.SuccessCodes
+	}
 
+	var totalRqDelta, successDelta, shedDelta float64
+	var scrapedPods int
 	now := time.Now()
 
 	for _, pod := range pods {
-		if pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-		if pod.Status.PodIP == "" {
+		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 			continue
 		}
 
 		current, err := s.scrapePod(ctx, pod.Status.PodIP)
 		if err != nil {
-			// Non-fatal — skip this pod, use others
 			continue
 		}
 
@@ -152,51 +125,58 @@ func (s *Scraper) ReadSignals(
 		s.previous[pod.Name] = current
 
 		if !hasPrev {
-			// First scrape for this pod — no delta to compute yet
 			continue
 		}
 
-		// Compute per-interval deltas from cumulative counters.
-		// Envoy counters are monotonically increasing — never reset.
-		// Delta = current - previous gives us the per-interval count.
 		intervalSeconds := current.scrapedAt.Sub(prev.scrapedAt).Seconds()
 		if intervalSeconds < 0.1 {
-			// Scrapes too close together — skip to avoid division noise
 			continue
 		}
 
 		rqDelta := current.rqTotal - prev.rqTotal
 		if rqDelta < 0 {
-			// Counter reset (pod restart) — skip this interval
-			continue
+			continue // counter reset on pod restart
 		}
 
-		// Success = 2xx + 3xx (same as our SuccessCodes default 100-399)
-		successfulDelta := (current.rq2xx - prev.rq2xx) + (current.rq3xx - prev.rq3xx)
-		if successfulDelta < 0 {
-			successfulDelta = 0
+		// Compute success delta using per-class deltas and successCodes config.
+		// This matches what admission_control filter measures internally.
+		classDelta := map[int]float64{
+			2: nonNegDelta(current.rq2xx, prev.rq2xx),
+			3: nonNegDelta(current.rq3xx, prev.rq3xx),
+			4: nonNegDelta(current.rq4xx, prev.rq4xx),
+			5: nonNegDelta(current.rq5xx, prev.rq5xx),
 		}
-
-		shedDeltaPod := current.shedTotal - prev.shedTotal
-		if shedDeltaPod < 0 {
-			shedDeltaPod = 0
+		var podSuccessDelta float64
+		for class, delta := range classDelta {
+			if statusClassInSuccessRanges(class, successRanges) {
+				podSuccessDelta += delta
+			}
 		}
 
 		totalRqDelta += rqDelta
-		successDelta += successfulDelta
-		shedDelta += shedDeltaPod
+		successDelta += podSuccessDelta
+		shedDelta += nonNegDelta(current.shedTotal, prev.shedTotal)
 		scrapedPods++
 	}
 
+	// Prune stale pod entries
+	activePodNames := make(map[string]struct{}, len(pods))
+	for _, pod := range pods {
+		activePodNames[pod.Name] = struct{}{}
+	}
+	for name := range s.previous {
+		if _, alive := activePodNames[name]; !alive {
+			delete(s.previous, name)
+		}
+	}
+
 	if scrapedPods == 0 || totalRqDelta < 1 {
-		// No usable data — return safe defaults to avoid false triggers
 		return safeDefaults(), nil
 	}
 
-	// Compute interval duration from scrape timestamps
-	intervalDuration := now.Sub(s.oldestPreviousTimestamp(pods))
+	intervalDuration := now.Sub(s.oldestPreviousTimestamp(pods, now))
 	if intervalDuration < time.Second {
-		intervalDuration = 30 * time.Second // default interval
+		intervalDuration = 30 * time.Second
 	}
 
 	successRate := successDelta / totalRqDelta
@@ -204,69 +184,47 @@ func (s *Scraper) ReadSignals(
 		successRate = 1.0
 	}
 
-	rps := totalRqDelta / intervalDuration.Seconds()
-
 	return trigger.Signals{
 		SuccessRate:      successRate,
-		ServiceLatencyMs: 0, // v1: not available without traces; v2 OTLP fills this
-		TotalLatencyMs:   0, // v1: not available from stats endpoint counters
-		RPS:              rps,
+		ServiceLatencyMs: 0, // v2 OTel fills this
+		TotalLatencyMs:   0,
+		RPS:              totalRqDelta / intervalDuration.Seconds(),
 		SampleCount:      int64(totalRqDelta),
 		CollectedAt:      now,
 	}, nil
 }
 
-// scrapePod fetches and parses Prometheus-format metrics from one pod's
-// Envoy sidecar stats endpoint.
 func (s *Scraper) scrapePod(ctx context.Context, podIP string) (counterSnapshot, error) {
 	url := fmt.Sprintf("http://%s:%d%s", podIP, envoyStatsPort, statsPath)
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return counterSnapshot{}, fmt.Errorf("building request: %w", err)
 	}
-
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return counterSnapshot{}, fmt.Errorf("scraping %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return counterSnapshot{}, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
 	}
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatsBodyBytes))
 	if err != nil {
 		return counterSnapshot{}, fmt.Errorf("reading response: %w", err)
 	}
-
 	return parseMetrics(string(body))
 }
 
-// parseMetrics parses a Prometheus text format response and extracts the
-// specific counter values we need. Only processes lines we care about —
-// no full Prometheus parser needed for this small set of metrics.
-//
-// Example Prometheus line:
-//
-//	envoy_cluster_upstream_rq_total{envoy_cluster_name="..."} 12345
 func parseMetrics(body string) (counterSnapshot, error) {
 	snap := counterSnapshot{scrapedAt: time.Now()}
-
 	for _, line := range strings.Split(body, "\n") {
-		// Skip comments and empty lines
 		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
 			continue
 		}
-
-		// Extract metric name and value
-		// Format: metric_name{labels} value [timestamp]
 		name, value, ok := parsePromLine(line)
 		if !ok {
 			continue
 		}
-
 		switch {
 		case strings.HasPrefix(name, metricUpstreamRqTotal):
 			snap.rqTotal += value
@@ -274,57 +232,51 @@ func parseMetrics(body string) (counterSnapshot, error) {
 			snap.rq2xx += value
 		case strings.HasPrefix(name, metricUpstreamRq3xx):
 			snap.rq3xx += value
+		case strings.HasPrefix(name, metricUpstreamRq4xx):
+			snap.rq4xx += value
 		case strings.HasPrefix(name, metricUpstreamRq5xx):
 			snap.rq5xx += value
 		case strings.HasPrefix(name, metricAdmissionRqShed):
 			snap.shedTotal += value
 		}
 	}
-
 	return snap, nil
 }
 
-// parsePromLine parses one Prometheus text format line.
-// Returns the metric name (without labels), the value, and whether parsing succeeded.
 func parsePromLine(line string) (string, float64, bool) {
-	// Find where labels end and value begins
-	// Line format: name{labels} value  OR  name value
-	lastSpace := strings.LastIndex(line, " ")
-	if lastSpace < 0 {
+	var splitIdx int
+	if braceIdx := strings.Index(line, "{"); braceIdx >= 0 {
+		closeIdx := strings.LastIndex(line, "}")
+		if closeIdx < braceIdx {
+			return "", 0, false
+		}
+		splitIdx = closeIdx + 1
+	} else {
+		splitIdx = strings.Index(line, " ")
+		if splitIdx < 0 {
+			return "", 0, false
+		}
+	}
+	if splitIdx >= len(line) {
 		return "", 0, false
 	}
-
-	valueStr := strings.TrimSpace(line[lastSpace+1:])
-	// Skip timestamp if present (space-separated after value)
-	if idx := strings.Index(valueStr, " "); idx >= 0 {
-		valueStr = valueStr[:idx]
+	rest := strings.TrimSpace(line[splitIdx:])
+	valueStr := rest
+	if spaceIdx := strings.Index(rest, " "); spaceIdx >= 0 {
+		valueStr = rest[:spaceIdx]
 	}
-
 	value, err := strconv.ParseFloat(valueStr, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return "", 0, false
 	}
-
-	// Reject NaN and Inf — only accept finite numbers
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return "", 0, false
+	name := line[:splitIdx]
+	if idx := strings.Index(name, "{"); idx >= 0 {
+		name = name[:idx]
 	}
-
-	// Extract metric name — everything before { or first space
-	nameAndLabels := line[:lastSpace]
-	name := nameAndLabels
-	if idx := strings.Index(nameAndLabels, "{"); idx >= 0 {
-		name = nameAndLabels[:idx]
-	}
-
 	return strings.TrimSpace(name), value, true
 }
 
-// discoverPods lists running pods matching the policy's workload selector.
-func (s *Scraper) discoverPods(
-	ctx context.Context,
-	policy *v1alpha1.AdaptivePolicy,
-) ([]corev1.Pod, error) {
+func (s *Scraper) discoverPods(ctx context.Context, policy *v1alpha1.AdaptivePolicy) ([]corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := s.k8sClient.List(ctx, podList,
 		client.InNamespace(policy.Namespace),
@@ -335,10 +287,8 @@ func (s *Scraper) discoverPods(
 	return podList.Items, nil
 }
 
-// oldestPreviousTimestamp returns the oldest timestamp in the previous snapshot
-// map for the given pods. Used to compute the actual interval duration.
-func (s *Scraper) oldestPreviousTimestamp(pods []corev1.Pod) time.Time {
-	oldest := time.Now()
+func (s *Scraper) oldestPreviousTimestamp(pods []corev1.Pod, ceiling time.Time) time.Time {
+	oldest := ceiling
 	for _, pod := range pods {
 		if snap, ok := s.previous[pod.Name]; ok {
 			if snap.scrapedAt.Before(oldest) {
@@ -349,12 +299,26 @@ func (s *Scraper) oldestPreviousTimestamp(pods []corev1.Pod) time.Time {
 	return oldest
 }
 
-// safeDefaults returns signals that will never fire any trigger.
-// Used when signals are unavailable to prevent false positives.
-func safeDefaults() trigger.Signals {
-	return trigger.Signals{
-		SuccessRate: 0.99,
-		RPS:         0,
-		CollectedAt: time.Now(),
+// statusClassInSuccessRanges returns true if the HTTP status class
+// (2=2xx, 3=3xx, 4=4xx, 5=5xx) falls within any configured success range.
+// Uses the class representative (200, 300, 400, 500) for range matching.
+func statusClassInSuccessRanges(statusClass int, ranges []v1alpha1.HTTPStatusRange) bool {
+	representative := int32(statusClass * 100)
+	for _, r := range ranges {
+		if representative >= r.Start && representative <= r.End {
+			return true
+		}
 	}
+	return false
+}
+
+func nonNegDelta(current, prev float64) float64 {
+	if d := current - prev; d > 0 {
+		return d
+	}
+	return 0
+}
+
+func safeDefaults() trigger.Signals {
+	return trigger.Signals{SuccessRate: 0.99, RPS: 0, CollectedAt: time.Now()}
 }

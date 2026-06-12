@@ -45,12 +45,19 @@ func NewState() *State {
 
 // Evaluate checks all triggers in order, returns the first actionable decision.
 // Triggers are evaluated in spec order — first matching trigger wins.
+// All trigger counters are updated on every call regardless of which trigger fires,
+// so that a low-priority trigger accumulating samples does not block a higher-priority
+// trigger from firing in the same reconcile loop.
 func Evaluate(policy *v1alpha1.AdaptivePolicy, signals Signals, state *State) Decision {
 	if !policy.HasTriggers() {
 		return Decision{Reason: "no triggers configured"}
 	}
 
 	currentProfile := policy.Spec.ActiveProfile
+
+	// closestToFiring holds the first trigger that has partial consecutive samples
+	// but hasn't fired yet — used for status visibility when no trigger fires.
+	var closestToFiring *Decision
 
 	for _, trigger := range policy.Spec.Triggers {
 		// fromProfiles constraint — only fire from listed profiles
@@ -79,7 +86,7 @@ func Evaluate(policy *v1alpha1.AdaptivePolicy, signals Signals, state *State) De
 		required := requiredSamples(trigger.When)
 
 		if met && consecutive >= required {
-			// Trigger fires
+			// Trigger fires — first match wins
 			state.LastTriggerFireTime[trigger.Name] = time.Now()
 			state.ConsecutiveBadSamples[trigger.Name] = 0
 			return Decision{
@@ -91,15 +98,22 @@ func Evaluate(policy *v1alpha1.AdaptivePolicy, signals Signals, state *State) De
 			}
 		}
 
-		// Return closest-to-firing trigger state for status visibility
-		if consecutive > 0 {
-			return Decision{
+		// Track first trigger with partial progress for status visibility.
+		// Do NOT return early — all triggers must be evaluated so their counters
+		// are updated and any later trigger that has reached its threshold can fire.
+		if consecutive > 0 && closestToFiring == nil {
+			d := Decision{
 				ShouldSwitch:          false,
 				TriggerName:           trigger.Name,
 				Reason:                fmt.Sprintf("%s — %d/%d consecutive samples", reason, consecutive, required),
 				ConsecutiveBadSamples: consecutive,
 			}
+			closestToFiring = &d
 		}
+	}
+
+	if closestToFiring != nil {
+		return *closestToFiring
 	}
 
 	return Decision{

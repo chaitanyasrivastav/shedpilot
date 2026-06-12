@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -296,9 +295,4 @@ func (r *CiliumRenderer) resourceLabels(policy *v1alpha1.AdaptivePolicy) map[str
 
 func ciliumEnvoyConfigName(policy *v1alpha1.AdaptivePolicy) string {
 	return fmt.Sprintf("shedpilot-%s", policy.Name)
-}
-
-// Unused but kept for symmetry — owner references are set directly above.
-func ownerReferencesCilium(policy *v1alpha1.AdaptivePolicy) []metav1.OwnerReference {
-	return ownerReferences(policy)
 }

@@ -192,7 +192,7 @@ func (r *IstioRenderer) renderAdmissionControl(
 			},
 			"runtime_key": rtdsKeyAdmissionThreshold,
 		},
-		"sheddingSpeed": map[string]interface{}{
+		"aggression": map[string]interface{}{
 			"default_value": mustParseFloat(sheddingSpeed),
 			"runtime_key":   rtdsKeyAdmissionAggression,
 		},
@@ -227,7 +227,7 @@ func (r *IstioRenderer) renderAdmissionControl(
 	// the EnvoyFilter. Used for sub-200ms profile switching.
 	rtdsLayer := map[string]interface{}{
 		rtdsKeyAdmissionEnabled:    enabled,
-		rtdsKeyAdmissionThreshold:  mustParseFloat(threshold),
+		rtdsKeyAdmissionThreshold:  mustParseFloat(threshold) / 100.0, // 0.0-1.0, matching typedConfig
 		rtdsKeyAdmissionAggression: mustParseFloat(sheddingSpeed),
 	}
 

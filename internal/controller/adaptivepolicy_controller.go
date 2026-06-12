@@ -1,12 +1,13 @@
 // Package controller implements the AdaptivePolicy reconcile loop.
 //
 // Reconcile steps:
-//  1. Fetch AdaptivePolicy — if not found, deleted (owner refs handle cleanup)
+//  1. Fetch AdaptivePolicy — if not found, clean up state and return
 //  2. Detect mesh backend (Istio / Cilium)
 //  3. Read live signals from Envoy stats endpoint
 //  4. Evaluate trigger conditions — switch profile if needed
 //  5. Render mesh-native resources (EnvoyFilter, DestinationRule)
 //  6. Apply rendered resources via server-side apply
+//  6b. Prune resources that were rendered before but are no longer needed
 //  7. If profile switched and RTDS connected — push sub-200ms runtime update
 //  8. Update status block (3am-legible, one kubectl describe tells all)
 package controller
@@ -14,9 +15,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,7 +54,9 @@ type AdaptivePolicyReconciler struct {
 	rtdsClient *rtds.Client
 
 	// triggerState persists consecutive sample counts across reconcile loops.
-	// Keyed by namespace/name.
+	// Keyed by namespace/name. Protected by tsMu — concurrent reconciles for
+	// different policies share this map and must not race on it.
+	tsMu         sync.Mutex
 	triggerState map[string]*trigger.State
 }
 
@@ -77,6 +83,12 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	policy := &v1alpha1.AdaptivePolicy{}
 	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Policy deleted — remove its trigger state to prevent unbounded map growth.
+			r.tsMu.Lock()
+			delete(r.triggerState, req.NamespacedName.String())
+			r.tsMu.Unlock()
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -97,15 +109,20 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// ── 3. Read signals ───────────────────────────────────────────────────────
 
-	// Lazily initialize triggerState if nil (handles manual instantiation in tests)
+	// Retrieve (or lazily create) the per-policy trigger state under the mutex.
+	// The pointer itself is stable after this block — the State struct is only
+	// accessed from this policy's reconcile goroutine, so no further locking
+	// is needed when reading/writing State fields via the extracted pointer.
+	r.tsMu.Lock()
 	if r.triggerState == nil {
 		r.triggerState = make(map[string]*trigger.State)
 	}
-
 	key := req.NamespacedName.String()
 	if _, ok := r.triggerState[key]; !ok {
 		r.triggerState[key] = trigger.NewState()
 	}
+	policyState := r.triggerState[key]
+	r.tsMu.Unlock()
 
 	signals, signalErr := r.scraper.ReadSignals(ctx, policy)
 	if signalErr != nil {
@@ -121,7 +138,10 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// ── 4. Evaluate triggers ──────────────────────────────────────────────────
 
-	decision, profileSwitched, switchErr := r.evaluateAndSwitch(ctx, policy, signals, key)
+	// Capture before evaluateAndSwitch patches spec.activeProfile.
+	originalProfile := policy.Spec.ActiveProfile
+
+	decision, profileSwitched, switchErr := r.evaluateAndSwitch(ctx, policy, signals, policyState)
 	if switchErr != nil {
 		logger.Error(switchErr, "trigger evaluation failed")
 		// Non-fatal — continue with current profile
@@ -163,6 +183,15 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	}
+
+	// ── 6b. Prune orphaned resources ─────────────────────────────────────────────
+	// Owner references cascade-delete resources only when the AdaptivePolicy
+	// itself is deleted. When a filter is disabled mid-lifecycle (e.g. setting
+	// admissionControl.enabled=false), its EnvoyFilter is no longer rendered
+	// and must be explicitly deleted here. We compare the previous
+	// status.managedResources (what existed before this reconcile) with the
+	// current renderResult (what should exist now) and delete the difference.
+	r.pruneOrphanedResources(ctx, policy, renderResult.ManagedResourceRefs)
 
 	// ── 7. RTDS push (sub-200ms delivery) ─────────────────────────────────────
 
@@ -209,7 +238,7 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		record := &v1alpha1.DecisionRecord{
 			Timestamp:      now,
 			TriggerName:    decision.TriggerName,
-			ProfileBefore:  policy.Spec.ActiveProfile,
+			ProfileBefore:  originalProfile,
 			ProfileAfter:   decision.TargetProfile,
 			SignalValues:   decision.Reason,
 			DeliveryMethod: deliveryMethod,
@@ -251,14 +280,14 @@ func (r *AdaptivePolicyReconciler) evaluateAndSwitch(
 	ctx context.Context,
 	policy *v1alpha1.AdaptivePolicy,
 	signals trigger.Signals,
-	key string,
+	state *trigger.State,
 ) (trigger.Decision, bool, error) {
 
 	if !policy.HasTriggers() {
 		return trigger.Decision{Reason: "no triggers configured"}, false, nil
 	}
 
-	decision := trigger.Evaluate(policy, signals, r.triggerState[key])
+	decision := trigger.Evaluate(policy, signals, state)
 
 	if !decision.ShouldSwitch {
 		return decision, false, nil
@@ -359,6 +388,46 @@ func deliveryMethodStr(rtdsConnected, profileSwitched bool) string {
 		return "rtds (<200ms)"
 	}
 	return "envoyfilter"
+}
+
+// pruneOrphanedResources deletes mesh resources that existed in the previous
+// reconcile but are no longer in the current render result.
+//
+// Owner references cascade-delete when the AdaptivePolicy is deleted, but they
+// do NOT help when a filter is merely disabled (e.g. admissionControl.enabled=false).
+// In that case the EnvoyFilter stays in the cluster enforcing the old config until
+// explicitly deleted. This function closes that gap by comparing
+// policy.Status.ManagedResources (old) with current (new) and deleting the diff.
+func (r *AdaptivePolicyReconciler) pruneOrphanedResources(
+	ctx context.Context,
+	policy *v1alpha1.AdaptivePolicy,
+	current []v1alpha1.ManagedResource,
+) {
+	logger := log.FromContext(ctx)
+
+	// Build a set of currently-rendered resources keyed by Kind/Name.
+	active := make(map[string]struct{}, len(current))
+	for _, mr := range current {
+		active[mr.Kind+"/"+mr.Name] = struct{}{}
+	}
+
+	for _, prev := range policy.Status.ManagedResources {
+		if _, ok := active[prev.Kind+"/"+prev.Name]; ok {
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion(prev.APIVersion)
+		obj.SetKind(prev.Kind)
+		obj.SetName(prev.Name)
+		obj.SetNamespace(prev.Namespace)
+		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to prune orphaned resource",
+				"kind", prev.Kind, "name", prev.Name)
+		} else if err == nil {
+			logger.Info("pruned orphaned resource",
+				"kind", prev.Kind, "name", prev.Name)
+		}
+	}
 }
 
 // setCondition upserts a condition — updates LastTransitionTime only on status change.
