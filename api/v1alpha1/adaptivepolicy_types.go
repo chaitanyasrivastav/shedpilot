@@ -580,6 +580,48 @@ type SignalConfig struct {
 	CapacityWarningWindowDays int32 `json:"capacityWarningWindowDays,omitempty"`
 }
 
+// DetectionConfig tunes the fast-poll detection loop introduced in v0.2.
+//
+// All fields are optional. Zero values use safe defaults (500ms poll,
+// 3 consecutive breaches to fire, 4 consecutive clean scrapes to recover).
+type DetectionConfig struct {
+	// PollIntervalMs is how often each pod's Envoy sidecar stats endpoint
+	// (:15090/stats/prometheus) is scraped, in milliseconds.
+	//
+	// Shorter = faster detection, marginally more in-cluster HTTP traffic.
+	// 100 pods at 500ms = 200 GETs/s, each ~10KB — negligible.
+	//
+	// Range: [100, 10000]. Default: 500.
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:validation:Maximum=10000
+	// +optional
+	PollIntervalMs int32 `json:"pollIntervalMs,omitempty"`
+
+	// ConsecutiveBreaches is how many back-to-back scrapes must all confirm
+	// a trigger condition before a profile switch fires.
+	//
+	// Higher = more conservative, slower to react, less flap-prone.
+	// Lower  = faster reaction, higher risk of reacting to transient noise.
+	//
+	// Range: [1, 20]. Default: 3 (1.5s at 500ms poll interval).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=20
+	// +optional
+	ConsecutiveBreaches int32 `json:"consecutiveBreaches,omitempty"`
+
+	// ConsecutiveRecoveries is how many back-to-back clean scrapes must pass
+	// before switching back to normal profile after a breach.
+	//
+	// Intentionally higher than ConsecutiveBreaches — recovery should be
+	// conservative to avoid oscillation on a borderline-healthy service.
+	//
+	// Range: [1, 20]. Default: 4 (2s at 500ms poll interval).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=20
+	// +optional
+	ConsecutiveRecoveries int32 `json:"consecutiveRecoveries,omitempty"`
+}
+
 // ─── Main spec ────────────────────────────────────────────────────────────────
 
 // AdaptivePolicySpec defines the desired state of an AdaptivePolicy.
@@ -669,6 +711,11 @@ type AdaptivePolicySpec struct {
 	// SignalConfig controls how the controller reads metrics for trigger evaluation.
 	// +optional
 	SignalConfig *SignalConfig `json:"signalConfig,omitempty"`
+
+	// Detection tunes the fast-poll signal collection loop.
+	// All fields are optional with safe defaults.
+	// +optional
+	Detection *DetectionConfig `json:"detection,omitempty"`
 }
 
 // ─── Status ───────────────────────────────────────────────────────────────────

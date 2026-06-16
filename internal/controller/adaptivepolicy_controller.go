@@ -7,7 +7,7 @@
 //  4. Evaluate trigger conditions — switch profile if needed
 //  5. Render mesh-native resources (EnvoyFilter, DestinationRule)
 //  6. Apply rendered resources via server-side apply
-//  6b. Prune resources that were rendered before but are no longer needed
+//     6b. Prune resources that were rendered before but are no longer needed
 //  7. If profile switched and RTDS connected — push sub-200ms runtime update
 //  8. Update status block (3am-legible, one kubectl describe tells all)
 package controller
@@ -58,6 +58,13 @@ type AdaptivePolicyReconciler struct {
 	// different policies share this map and must not race on it.
 	tsMu         sync.Mutex
 	triggerState map[string]*trigger.State
+
+	// pollers holds one running Poller goroutine per AdaptivePolicy.
+	// Each poller scrapes at its configured PollInterval and emits debounced
+	// signals on confirmed breach/recovery. Protected by pollerMu.
+	pollerMu      sync.Mutex
+	pollers       map[string]*signal.Poller
+	pollerCancels map[string]context.CancelFunc
 }
 
 // NewAdaptivePolicyReconciler creates a reconciler with all dependencies wired.
@@ -67,11 +74,13 @@ func NewAdaptivePolicyReconciler(
 	rtdsClient *rtds.Client,
 ) *AdaptivePolicyReconciler {
 	return &AdaptivePolicyReconciler{
-		Client:       c,
-		Scheme:       scheme,
-		scraper:      signal.NewScraper(c),
-		rtdsClient:   rtdsClient,
-		triggerState: make(map[string]*trigger.State),
+		Client:        c,
+		Scheme:        scheme,
+		scraper:       signal.NewScraper(c),
+		rtdsClient:    rtdsClient,
+		triggerState:  make(map[string]*trigger.State),
+		pollers:       make(map[string]*signal.Poller),
+		pollerCancels: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -84,10 +93,19 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	policy := &v1alpha1.AdaptivePolicy{}
 	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Policy deleted — remove its trigger state to prevent unbounded map growth.
+			key := req.NamespacedName.String()
+			// Policy deleted — remove trigger state to prevent unbounded map growth.
 			r.tsMu.Lock()
-			delete(r.triggerState, req.NamespacedName.String())
+			delete(r.triggerState, key)
 			r.tsMu.Unlock()
+			// Stop the background poller for this policy.
+			r.pollerMu.Lock()
+			if cancel, ok := r.pollerCancels[key]; ok {
+				cancel()
+				delete(r.pollerCancels, key)
+				delete(r.pollers, key)
+			}
+			r.pollerMu.Unlock()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -124,15 +142,28 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	policyState := r.triggerState[key]
 	r.tsMu.Unlock()
 
-	signals, signalErr := r.scraper.ReadSignals(ctx, policy)
-	if signalErr != nil {
-		// Non-fatal — log and use safe defaults.
-		// This is expected during pod startup before Envoy is ready.
-		logger.V(1).Info("signal read failed, using defaults", "error", signalErr)
-		signals = trigger.Signals{
-			SuccessRate: 0.99,
-			RPS:         0,
-			CollectedAt: time.Now(),
+	// Start the per-policy poller (idempotent — no-op if already running).
+	poller := r.ensurePoller(key, policy)
+
+	// Non-blocking: consume a debounced poller signal if one is ready.
+	// Otherwise fall back to a direct scrape so status fields stay fresh.
+	var signals trigger.Signals
+	select {
+	case signals = <-poller.Signals():
+		logger.V(1).Info("poller signal ready",
+			"successRate", signals.SuccessRate,
+			"rps", signals.RPS,
+		)
+	default:
+		var signalErr error
+		signals, signalErr = r.scraper.ReadSignals(ctx, policy)
+		if signalErr != nil {
+			logger.V(1).Info("signal read failed, using defaults", "error", signalErr)
+			signals = trigger.Signals{
+				SuccessRate: 0.99,
+				RPS:         0,
+				CollectedAt: time.Now(),
+			}
 		}
 	}
 
@@ -428,6 +459,55 @@ func (r *AdaptivePolicyReconciler) pruneOrphanedResources(
 				"kind", prev.Kind, "name", prev.Name)
 		}
 	}
+}
+
+// pollerConfig converts the CRD's DetectionConfig into a signal.PollerConfig.
+// Zero / nil values fall back to signal package defaults (applied in NewPoller).
+func pollerConfig(d *v1alpha1.DetectionConfig) signal.PollerConfig {
+	if d == nil {
+		return signal.PollerConfig{} // all defaults
+	}
+	return signal.PollerConfig{
+		PollInterval: func() time.Duration {
+			if d.PollIntervalMs > 0 {
+				return time.Duration(d.PollIntervalMs) * time.Millisecond
+			}
+			return signal.DefaultPollInterval
+		}(),
+		ConsecutiveBreaches: func() int {
+			if d.ConsecutiveBreaches > 0 {
+				return int(d.ConsecutiveBreaches)
+			}
+			return signal.DefaultConsecutiveBreaches
+		}(),
+		ConsecutiveRecoveries: func() int {
+			if d.ConsecutiveRecoveries > 0 {
+				return int(d.ConsecutiveRecoveries)
+			}
+			return signal.DefaultConsecutiveRecoveries
+		}(),
+	}
+}
+
+// ensurePoller returns the running Poller for this policy, starting one if needed.
+// Uses a background context — the poller outlives individual reconcile calls and
+// is cancelled explicitly when the policy is deleted.
+func (r *AdaptivePolicyReconciler) ensurePoller(key string, policy *v1alpha1.AdaptivePolicy) *signal.Poller {
+	r.pollerMu.Lock()
+	defer r.pollerMu.Unlock()
+	if r.pollers == nil {
+		r.pollers = make(map[string]*signal.Poller)
+		r.pollerCancels = make(map[string]context.CancelFunc)
+	}
+	if p, ok := r.pollers[key]; ok {
+		return p
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := signal.NewPoller(r.scraper, policy, pollerConfig(policy.Spec.Detection))
+	r.pollers[key] = p
+	r.pollerCancels[key] = cancel
+	go p.Run(ctx)
+	return p
 }
 
 // setCondition upserts a condition — updates LastTransitionTime only on status change.

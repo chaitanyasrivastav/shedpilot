@@ -121,6 +121,20 @@ func (r *IstioRenderer) Render(policy *v1alpha1.AdaptivePolicy) (*RenderResult, 
 		result.RTDSLayers[layerName] = rtds
 	}
 
+	// Layer 0 — bootstrap stats-flush patch (rendered whenever any filter is active).
+	// Without this Envoy buffers stats for up to 5s; with it every GET to
+	// :15090/stats/prometheus bypasses the internal flush timer and returns fresh data.
+	if policy.HasAdmissionControl() || policy.HasAdaptiveConcurrency() {
+		ef := r.renderStatsFlush(policy)
+		result.Resources = append(result.Resources, ef)
+		result.ManagedResourceRefs = append(result.ManagedResourceRefs, v1alpha1.ManagedResource{
+			APIVersion: istioNetworkingAPIVersion,
+			Kind:       "EnvoyFilter",
+			Name:       statsFlushName(policy),
+			Namespace:  policy.Namespace,
+		})
+	}
+
 	// Layer 3 — streaming protection (DestinationRule.connectionPool)
 	if policy.HasStreamingProtection() {
 		dr, err := r.renderStreamingProtection(policy)
@@ -292,6 +306,43 @@ func (r *IstioRenderer) renderAdaptiveConcurrency(
 	return ef, rtdsLayer, nil
 }
 
+// renderStatsFlush generates an EnvoyFilter BOOTSTRAP patch that sets
+// stats_flush_on_admin: true. This makes every GET to :15090/stats/prometheus
+// bypass Envoy's internal 5s stats flush timer and return genuinely fresh data.
+// New pods pick up the bootstrap config at startup; existing pods need one rolling
+// restart (which the operator can trigger via an annotation bump).
+func (r *IstioRenderer) renderStatsFlush(policy *v1alpha1.AdaptivePolicy) *unstructured.Unstructured {
+	ef := &unstructured.Unstructured{}
+	ef.SetAPIVersion(istioNetworkingAPIVersion)
+	ef.SetKind("EnvoyFilter")
+	ef.SetName(statsFlushName(policy))
+	ef.SetNamespace(policy.Namespace)
+	ef.SetLabels(r.resourceLabels(policy))
+	ef.SetOwnerReferences(ownerReferences(policy))
+
+	_ = unstructured.SetNestedStringMap(ef.Object,
+		policy.Spec.Selector,
+		"spec", "workloadSelector", "labels",
+	)
+
+	_ = unstructured.SetNestedSlice(ef.Object,
+		[]interface{}{
+			map[string]interface{}{
+				"applyTo": "BOOTSTRAP",
+				"patch": map[string]interface{}{
+					"operation": "MERGE",
+					"value": map[string]interface{}{
+						"stats_flush_on_admin": true,
+					},
+				},
+			},
+		},
+		"spec", "configPatches",
+	)
+
+	return ef
+}
+
 // renderStreamingProtection generates a DestinationRule for gRPC/WebSocket limits.
 func (r *IstioRenderer) renderStreamingProtection(
 	policy *v1alpha1.AdaptivePolicy,
@@ -409,6 +460,10 @@ func adaptiveConcurrencyName(policy *v1alpha1.AdaptivePolicy) string {
 
 func streamingProtectionName(policy *v1alpha1.AdaptivePolicy) string {
 	return fmt.Sprintf("%s-streaming", policy.Name)
+}
+
+func statsFlushName(policy *v1alpha1.AdaptivePolicy) string {
+	return fmt.Sprintf("%s-stats-flush", policy.Name)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
