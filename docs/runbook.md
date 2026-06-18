@@ -1,24 +1,26 @@
 # Runbook
 
-This document is written for engineers responding to incidents at 3am. It answers specific questions with specific commands.
+Written for engineers responding to incidents. Read status first. Then act.
 
-## First — read the status
-
-One command. Read this first before doing anything else.
+## Read the status first
 
 ```bash
 kubectl describe adaptivepolicy <name> -n <namespace>
 ```
 
-The status block tells you:
-- **Detected Backend** — which mesh is running
-- **Active Profile** — which profile is currently enforced
-- **Shed Rate Now** — approximate percentage of requests being rejected
-- **RTDS Connected** — whether fast profile switching is available
-- **Last Decision** — what switched, when, why, and what happened
-- **Consecutive Bad Samples** — how close to the next trigger firing
-- **Next Trigger Evaluation** — when the controller will evaluate again
-- **Ready** — whether the controller is reconciling correctly
+This one command tells you:
+
+| Field | What it means |
+|---|---|
+| **Active Profile** | Which profile is currently enforced |
+| **Shed Rate Now** | Approximate % of requests being rejected |
+| **RTDS Connected** | Whether fast delivery (<200ms) is available |
+| **Last Decision** | What switched, when, why, signal values, delivery method |
+| **Consecutive Bad Samples** | How close to the next trigger firing |
+| **Next Trigger Evaluation** | When the controller next evaluates |
+| **Ready** | Whether the controller is reconciling correctly |
+
+Read Last Decision and Decision History before taking any action. They tell you what shedpilot has already done and why.
 
 ---
 
@@ -26,7 +28,7 @@ The status block tells you:
 
 ### Freeze automatic switches
 
-Use when you want to stop the controller from making any more autonomous decisions. Enforcement continues — filters keep running at their current profile. Only automatic switches are blocked.
+Use when you want to stop all autonomous decisions. Enforcement continues — filters keep running at the current profile. Only automatic profile switches are blocked.
 
 ```bash
 kubectl annotate adaptivepolicy payments shedpilot.io/human-override=true -n production
@@ -38,34 +40,31 @@ Remove the freeze:
 kubectl annotate adaptivepolicy payments shedpilot.io/human-override- -n production
 ```
 
-### Switch to observe mode
+### Switch to observe-only mode
 
-Use when you want to keep filters installed but immediately stop all rejection. No traffic will be shed. The controller continues to evaluate triggers and update status.
+Filters stay installed. All request rejection stops immediately. Trigger evaluation and status updates continue — you can still see what would happen.
 
 ```bash
 kubectl patch adaptivepolicy payments -n production \
   --type merge -p '{"spec":{"dryRun":true}}'
 ```
 
-### Manually switch profile
+### Force a profile switch
 
 ```bash
-# Switch to degraded
 kubectl patch adaptivepolicy payments -n production \
   --type merge -p '{"spec":{"activeProfile":"degraded"}}'
 
-# Switch to critical
 kubectl patch adaptivepolicy payments -n production \
   --type merge -p '{"spec":{"activeProfile":"critical"}}'
 
-# Return to normal
 kubectl patch adaptivepolicy payments -n production \
   --type merge -p '{"spec":{"activeProfile":"normal"}}'
 ```
 
 ### Remove everything
 
-Nuclear option. Removes the policy and cascade-deletes all EnvoyFilters and DestinationRules. Envoy sidecars return to zero shedpilot configuration.
+Removes the policy and cascade-deletes all EnvoyFilters and DestinationRules. Envoy sidecars return to zero shedpilot configuration.
 
 ```bash
 kubectl delete adaptivepolicy payments -n production
@@ -75,36 +74,35 @@ kubectl delete adaptivepolicy payments -n production
 
 ## Scenario playbook
 
-### Scenario: Service is degraded, controller switched profile automatically
+### Service is degraded — controller switched profile automatically
 
-**Signs:** `Active Profile: degraded`, `Shed Rate Now: ~40%`, `Last Decision` shows trigger fired.
-
-**What to check:**
+Signs: `Active Profile: degraded`, `Shed Rate Now: ~40%`, Last Decision shows trigger fired.
 
 ```bash
-# 1. Read the status — what triggered the switch?
+# 1. Read the full status
 kubectl describe adaptivepolicy payments -n production
 
 # 2. Is success rate recovering?
-kubectl logs -n shedpilot-system -l app=shedpilot --tail=50
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager | grep "signal read" | tail -5
 
 # 3. Are pods healthy?
 kubectl get pods -n production -l app=payments
 
-# 4. Is there a downstream issue?
-kubectl describe adaptivepolicy <downstream-service> -n production
+# 4. Any downstream service also degraded?
+kubectl get adaptivepolicies -n production
 ```
 
-**If the service is recovering:** wait. The recovery trigger will fire when success rate stays above 97% for 3 consecutive evaluations. Normal is restored automatically.
+If the service is recovering: wait. The recovery trigger fires when success rate stays above 97% for 3 consecutive evaluations. Normal restores automatically.
 
-**If the service is not recovering:** escalate manually.
+If the service is not recovering and you need more aggressive protection:
 
 ```bash
 kubectl patch adaptivepolicy payments -n production \
   --type merge -p '{"spec":{"activeProfile":"critical"}}'
 ```
 
-**If you need to stop shedding immediately** (e.g. the degradation was a false positive):
+If the degradation was a false positive and you need to stop shedding immediately:
 
 ```bash
 kubectl patch adaptivepolicy payments -n production \
@@ -113,31 +111,17 @@ kubectl patch adaptivepolicy payments -n production \
 
 ---
 
-### Scenario: Controller switched profile but service is still degraded
+### Service still degraded after profile switch
 
-**Signs:** `Active Profile: degraded`, high error rate continues, `Shed Rate Now: ~40%` but success rate not recovering.
+Signs: Active Profile is degraded or critical, high error rate continues, success rate not recovering.
 
-**Possible causes:**
-1. The threshold is too loose — degraded profile isn't shedding enough
-2. The problem is downstream — shedding inbound load doesn't help a slow database
-3. Pods are OOMKilled or crashing — shedding doesn't fix broken pods
+Possible causes:
 
-**Check downstream:**
+**Downstream dependency is the problem.** shedpilot sheds inbound load which reduces downstream call volume — helpful but may not be sufficient if the dependency is completely unavailable. Check the dependency directly.
 
-```bash
-# Is the database slow?
-kubectl describe adaptivepolicy <db-proxy-service> -n production
+**Pods are crashing or OOMKilled.** shedpilot cannot fix broken pods. Address the root cause.
 
-# Are pods crashing?
-kubectl get pods -n production -l app=payments
-kubectl describe pod <crashing-pod> -n production
-```
-
-**If downstream is the issue:** shedpilot reduces load on your service, which reduces load on the database. Give it 2–3 minutes. If not recovering, the database needs direct intervention.
-
-**If pods are crashing:** shedpilot cannot fix broken pods. Address the root cause directly.
-
-**If threshold is too loose:** manually escalate to critical.
+**Threshold too loose.** The degraded profile may not be shedding enough. Escalate manually to critical.
 
 ```bash
 kubectl patch adaptivepolicy payments -n production \
@@ -146,119 +130,143 @@ kubectl patch adaptivepolicy payments -n production \
 
 ---
 
-### Scenario: Service is over-shedding (too much traffic being rejected)
+### Service is over-shedding — too many 503s
 
-**Signs:** `Shed Rate Now: ~70%`, success rate is high (99%+), legitimate traffic is being rejected.
+Signs: Shed Rate Now is high (60–80%), success rate is actually fine (99%+), legitimate clients getting rejected.
 
-Over-shedding happens when the service recovers but the protection is still too aggressive.
+Over-shedding happens when the service recovered but protection is still aggressive.
 
-**Quick fix — relax by switching to a less aggressive profile:**
+Immediate fix:
 
 ```bash
 kubectl patch adaptivepolicy payments -n production \
   --type merge -p '{"spec":{"activeProfile":"normal"}}'
 ```
 
-**If triggers keep switching back to degraded:** the threshold may be miscalibrated. Temporarily freeze:
+If triggers keep switching back to degraded:
 
 ```bash
-kubectl annotate adaptivepolicy payments shedpilot.io/human-override=true -n production
-```
+# Freeze first
+kubectl annotate adaptivepolicy payments -n production \
+  shedpilot.io/human-override=true
 
-Then review your threshold settings and update them:
-
-```bash
+# Then review and raise thresholds
 kubectl edit adaptivepolicy payments -n production
 # Increase successRateThreshold in the degraded profile
 # or increase consecutiveSamples in the trigger
+
+# Unfreeze after adjusting
+kubectl annotate adaptivepolicy payments -n production \
+  shedpilot.io/human-override-
 ```
 
 ---
 
-### Scenario: Controller shows Ready: False
-
-**Signs:** `Ready: False`, `Conditions` shows `Degraded: True`.
+### Ready: False
 
 ```bash
-# Read the detailed error message
 kubectl describe adaptivepolicy payments -n production | grep -A5 "Degraded"
-
-# Common causes:
-# MeshDetectionFailed — istiod not running?
-kubectl get pods -n istio-system -l app=istiod
-
-# ApplyFailed — Istio webhook rejected the EnvoyFilter config
-kubectl get events -n production --sort-by='.lastTimestamp' | tail -20
-
-# RenderFailed — invalid policy configuration
-kubectl describe adaptivepolicy payments -n production
 ```
+
+| Reason | Cause | Fix |
+|---|---|---|
+| MeshDetectionFailed | istiod pod not running | kubectl get pods -n istio-system -l app=istiod |
+| ApplyFailed | Istio webhook rejected EnvoyFilter | kubectl get events -n production; check successRateThreshold format |
+| RenderFailed | Invalid policy config | Check the message field for specifics |
+
+The most common ApplyFailed cause: `successRateThreshold` sent as decimal (`0.95`) instead of percentage string (`"95.0"`). Ensure all threshold fields use percentage strings.
 
 ---
 
-### Scenario: RTDS Connected: false
+### RTDS Connected: false
 
-**Signs:** `RTDS Connected: false`. Profile switches still work but use the EnvoyFilter path (5–30s instead of <200ms).
+Profile switches still work but use the EnvoyFilter path (5–30s instead of <200ms).
 
 ```bash
-# Check if istiod is healthy
-kubectl get pods -n istio-system -l app=istiod
+# Check if fast delivery RBAC is granted
+kubectl auth can-i create pods/exec \
+  --namespace production \
+  --as system:serviceaccount:shedpilot-system:shedpilot-controller-manager
 
-# Check controller logs for RTDS errors
-kubectl logs -n shedpilot-system -l app=shedpilot --tail=100 | grep -i rtds
+# Check controller logs
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager | grep -i "fast delivery\|forbidden"
 ```
 
-The controller reconnects automatically when Istiod is available. During disconnection, profile switches use the EnvoyFilter path — slower but still functional.
+If `no` from auth check, apply the pods/exec permission — see README RBAC requirements.
 
 ---
 
-### Scenario: ScalabilityWarning condition is True
+### ScalabilityWarning condition is True
 
-**Signs:** `ScalabilityWarning: true`, detail says something like "service was in non-normal profile for 18% of the last 7 days."
-
-**This is not an incident — it's a signal.** Your service is shedding load chronically. The correct response is not to tune shedpilot further — it's to scale up the service permanently.
+This is not an incident — it is a signal.
 
 ```bash
-# See the detail
 kubectl describe adaptivepolicy payments -n production | grep -A3 "Scalability Warning"
-
-# Check what the normal load looks like vs what your replicas can handle
-kubectl top pods -n production -l app=payments
-kubectl get hpa -n production
 ```
+
+The service is chronically shedding load. This means capacity is permanently insufficient. The correct response is not to tune shedpilot further.
 
 Options:
-1. Increase the replica count permanently
-2. Increase pod resource limits
-3. Optimise the service to handle more load per pod
-4. Reduce `capacityWarningPercent` if the warning threshold is miscalibrated
+- Increase replica count permanently via HPA minReplicas
+- Increase pod resource limits
+- Optimise the service to handle more load per pod
 
 ---
 
-## Decision log
+### Trigger oscillation — profile switches back and forth
 
-The status keeps the last 10 decisions. Read them to understand what happened during an incident:
+Signs: Decision history shows alternating degraded/normal every 30s.
+
+Most common cause: recovery trigger firing on zero-sample safe defaults immediately after a breach.
+
+```bash
+# Check the signal values in decision history
+kubectl get adaptivepolicy payments -n production \
+  -o jsonpath='{.status.decisionHistory}' | python3 -m json.tool | grep signalValues
+```
+
+If signalValues shows `successRate=0.990` on recovery decisions, that is the safe default (0.99) not a real reading. Ensure you are on v0.2+ and that trigger evaluation is skipped on zero-sample reads.
+
+Also check cooldownSeconds — if shorter than evaluationIntervalSeconds, triggers can re-fire on consecutive reconciles.
+
+---
+
+## Decision history
+
+Last 10 decisions with full context:
 
 ```bash
 kubectl get adaptivepolicy payments -n production \
   -o jsonpath='{.status.decisionHistory}' | python3 -m json.tool
 ```
 
-Each decision shows: timestamp, trigger name, signal values, profile before/after, delivery method, and outcome. This is your incident timeline without needing to query logs.
+Each decision shows: timestamp, trigger name, signal values that caused the decision, profiles before/after, delivery method, and outcome. This is your incident timeline without needing to grep logs.
 
 ---
 
 ## Controller logs
 
 ```bash
-# Stream controller logs
-kubectl logs -n shedpilot-system -l app=shedpilot -f
+# Stream all logs
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager -f
 
 # Filter for a specific policy
-kubectl logs -n shedpilot-system -l app=shedpilot | grep "payments"
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager | grep '"name":"payments"'
 
-# Filter for errors only
-kubectl logs -n shedpilot-system -l app=shedpilot | grep '"level":"error"'
+# Errors only
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager | grep '"level":"error"'
+
+# Signal reads — verify scraping is working
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager | grep "signal read"
+
+# Fast delivery results
+kubectl logs -n shedpilot-system \
+  deployment/shedpilot-controller-manager | grep "fast delivery"
 ```
 
 ---
@@ -268,9 +276,8 @@ kubectl logs -n shedpilot-system -l app=shedpilot | grep '"level":"error"'
 ```bash
 kubectl get envoyfilter -n production
 
-# Inspect the actual filter config Istio accepted
 kubectl get envoyfilter payments-admission-control -n production -o yaml
 kubectl get envoyfilter payments-adaptive-concurrency -n production -o yaml
 ```
 
-If EnvoyFilters are missing but the policy exists and is Ready, the controller should recreate them on the next reconcile (within 30s). If they stay missing, check controller logs for apply errors.
+If EnvoyFilters are missing but the policy is Ready, the controller recreates them on the next reconcile (within evaluationIntervalSeconds). If they stay missing, check controller logs for apply errors.
