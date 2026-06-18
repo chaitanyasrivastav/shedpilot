@@ -1,11 +1,5 @@
 # shedpilot v0.2 — Manual Test Report
 
-**Date:** 2026-06-18  
-**Cluster:** kind (shedpilot-test-e2e), single node  
-**Istio:** 1.30.0  
-**Operator:** shedpilot:dev (built from main)  
-**Tester:** Chaitanya Srivastav
-
 ---
 
 ## Environment Setup
