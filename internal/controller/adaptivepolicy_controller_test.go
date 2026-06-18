@@ -28,8 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	resiliencev1alpha1 "github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
-	"github.com/chaitanyasrivastav/shedpilot/internal/signal"
-	"github.com/chaitanyasrivastav/shedpilot/internal/trigger"
 )
 
 var _ = Describe("AdaptivePolicy Controller", func() {
@@ -158,12 +156,11 @@ var _ = Describe("AdaptivePolicy Controller", func() {
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &AdaptivePolicyReconciler{
-				Client:       k8sClient,
-				Scheme:       k8sClient.Scheme(),
-				scraper:      signal.NewScraper(k8sClient),
-				triggerState: make(map[string]*trigger.State),
-			}
+			controllerReconciler := NewAdaptivePolicyReconciler(
+				k8sClient,
+				k8sClient.Scheme(),
+				nil, // rtdsClient can be nil for testing
+			)
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,

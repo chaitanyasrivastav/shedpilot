@@ -49,6 +49,12 @@ func NewState() *State {
 // so that a low-priority trigger accumulating samples does not block a higher-priority
 // trigger from firing in the same reconcile loop.
 func Evaluate(policy *v1alpha1.AdaptivePolicy, signals Signals, state *State) Decision {
+	if signals.SampleCount == 0 {
+		return Decision{
+			Reason: "skipping evaluation — no samples collected this interval",
+		}
+	}
+
 	if !policy.HasTriggers() {
 		return Decision{Reason: "no triggers configured"}
 	}

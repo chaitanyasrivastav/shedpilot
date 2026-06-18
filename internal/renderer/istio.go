@@ -202,7 +202,7 @@ func (r *IstioRenderer) renderAdmissionControl(
 		"sampling_window": successRateWindow,
 		"sr_threshold": map[string]interface{}{
 			"default_value": map[string]interface{}{
-				"value": mustParseFloat(threshold) / 100.0, // 0.0-1.0 range
+				"value": mustParseFloat(threshold), // 0.0-1.0 range
 			},
 			"runtime_key": rtdsKeyAdmissionThreshold,
 		},

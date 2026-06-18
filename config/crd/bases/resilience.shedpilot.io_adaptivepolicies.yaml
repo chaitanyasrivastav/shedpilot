@@ -14,7 +14,7 @@ spec:
     listKind: AdaptivePolicyList
     plural: adaptivepolicies
     shortNames:
-    - ap
+    - adp
     singular: adaptivepolicy
   scope: Namespaced
   versions:
@@ -230,6 +230,51 @@ spec:
                     type: string
                 required:
                 - enabled
+                type: object
+              detection:
+                description: |-
+                  Detection tunes the fast-poll signal collection loop.
+                  All fields are optional with safe defaults.
+                properties:
+                  consecutiveBreaches:
+                    description: |-
+                      ConsecutiveBreaches is how many back-to-back scrapes must all confirm
+                      a trigger condition before a profile switch fires.
+
+                      Higher = more conservative, slower to react, less flap-prone.
+                      Lower  = faster reaction, higher risk of reacting to transient noise.
+
+                      Range: [1, 20]. Default: 3 (1.5s at 500ms poll interval).
+                    format: int32
+                    maximum: 20
+                    minimum: 1
+                    type: integer
+                  consecutiveRecoveries:
+                    description: |-
+                      ConsecutiveRecoveries is how many back-to-back clean scrapes must pass
+                      before switching back to normal profile after a breach.
+
+                      Intentionally higher than ConsecutiveBreaches — recovery should be
+                      conservative to avoid oscillation on a borderline-healthy service.
+
+                      Range: [1, 20]. Default: 4 (2s at 500ms poll interval).
+                    format: int32
+                    maximum: 20
+                    minimum: 1
+                    type: integer
+                  pollIntervalMs:
+                    description: |-
+                      PollIntervalMs is how often each pod's Envoy sidecar stats endpoint
+                      (:15090/stats/prometheus) is scraped, in milliseconds.
+
+                      Shorter = faster detection, marginally more in-cluster HTTP traffic.
+                      100 pods at 500ms = 200 GETs/s, each ~10KB — negligible.
+
+                      Range: [100, 10000]. Default: 500.
+                    format: int32
+                    maximum: 10000
+                    minimum: 100
+                    type: integer
                 type: object
               dryRun:
                 default: false

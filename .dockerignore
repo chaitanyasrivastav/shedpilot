@@ -6,6 +6,13 @@
 !**/*.go
 **/*_test.go
 
+!cmd/
+!cmd/**
+!api/
+!api/**
+!internal/
+!internal/**
+
 # Re-include Go module files
 !go.mod
 !go.sum

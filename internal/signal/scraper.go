@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
 	"github.com/chaitanyasrivastav/shedpilot/internal/trigger"
@@ -34,16 +35,17 @@ const (
 	scrapeTimeout     = 3 * time.Second
 	maxStatsBodyBytes = 4 * 1024 * 1024 // 4 MiB — OOM guard
 
-	metricUpstreamRqTotal = "envoy_cluster_upstream_rq_total"
-	metricUpstreamRq2xx   = "envoy_cluster_upstream_rq_2xx"
-	metricUpstreamRq3xx   = "envoy_cluster_upstream_rq_3xx"
+	// metricUpstreamRqTotal    = "envoy_cluster_upstream_rq_total"
+	// metricUpstreamRq2xx      = "envoy_cluster_upstream_rq_2xx"
+	// metricUpstreamRq3xx      = "envoy_cluster_upstream_rq_3xx"
+	metricIstioRequestsTotal = "istio_requests_total"
 	// 4xx IS tracked — whether it counts as success depends on policy.successCodes.
 	// Default successCodes is 100-399, so 4xx is a failure by default.
 	// But validation APIs that return 400 for bad input have a naturally low
 	// "success rate" under the hardcoded 2xx+3xx formula even when healthy.
 	// Tracking 4xx separately and applying successCodes config fixes this.
-	metricUpstreamRq4xx   = "envoy_cluster_upstream_rq_4xx"
-	metricUpstreamRq5xx   = "envoy_cluster_upstream_rq_5xx"
+	// metricUpstreamRq4xx   = "envoy_cluster_upstream_rq_4xx"
+	// metricUpstreamRq5xx   = "envoy_cluster_upstream_rq_5xx"
 	metricAdmissionRqShed = "envoy_http_admission_control_requests_ejected"
 )
 
@@ -120,9 +122,24 @@ func (s *Scraper) ReadSignals(
 		if err != nil {
 			continue
 		}
+		// TEMPORARY DEBUG — remove after fixing
+		log.FromContext(ctx).Info("pod scrape",
+			"pod", pod.Name,
+			"rqTotal", current.rqTotal,
+			"rq2xx", current.rq2xx,
+			"rq5xx", current.rq5xx,
+			"shedTotal", current.shedTotal,
+		)
 
 		prev, hasPrev := s.previous[pod.Name]
 		s.previous[pod.Name] = current
+		// ADD THIS:
+		log.FromContext(ctx).Info("prev check",
+			"pod", pod.Name,
+			"hasPrev", hasPrev,
+			"prevTotal", prev.rqTotal,
+			"currTotal", current.rqTotal,
+		)
 
 		if !hasPrev {
 			continue
@@ -137,6 +154,14 @@ func (s *Scraper) ReadSignals(
 		if rqDelta < 0 {
 			continue // counter reset on pod restart
 		}
+		// ADD THIS:
+		log.FromContext(ctx).Info("delta",
+			"pod", pod.Name,
+			"prevTotal", prev.rqTotal,
+			"currTotal", current.rqTotal,
+			"delta", rqDelta,
+			"intervalSecs", current.scrapedAt.Sub(prev.scrapedAt).Seconds(),
+		)
 
 		// Compute success delta using per-class deltas and successCodes config.
 		// This matches what admission_control filter measures internally.
@@ -217,30 +242,91 @@ func (s *Scraper) scrapePod(ctx context.Context, podIP string) (counterSnapshot,
 
 func parseMetrics(body string) (counterSnapshot, error) {
 	snap := counterSnapshot{scrapedAt: time.Now()}
+	var istioLines int
 	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "istio_requests_total{") {
+			istioLines++
+			fmt.Printf("DEBUG istio line: %q\n", line[:min(len(line), 100)])
+		}
 		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
 			continue
 		}
-		name, value, ok := parsePromLine(line)
+
+		if strings.HasPrefix(line, metricAdmissionRqShed) {
+			if _, value, ok := parsePromLine(line); ok {
+				snap.shedTotal += value
+			}
+			continue
+		}
+
+		// istio_requests_total{...,response_code="200",...} 154
+		if !strings.HasPrefix(line, "istio_requests_total{") {
+			continue
+		}
+		_, value, ok := parsePromLine(line)
 		if !ok {
 			continue
 		}
-		switch {
-		case strings.HasPrefix(name, metricUpstreamRqTotal):
-			snap.rqTotal += value
-		case strings.HasPrefix(name, metricUpstreamRq2xx):
+		code := extractLabel(line, "response_code")
+		class := httpClass(code)
+		switch class {
+		case 2:
 			snap.rq2xx += value
-		case strings.HasPrefix(name, metricUpstreamRq3xx):
+			snap.rqTotal += value
+		case 3:
 			snap.rq3xx += value
-		case strings.HasPrefix(name, metricUpstreamRq4xx):
+			snap.rqTotal += value
+		case 4:
 			snap.rq4xx += value
-		case strings.HasPrefix(name, metricUpstreamRq5xx):
+			snap.rqTotal += value
+		case 5:
 			snap.rq5xx += value
-		case strings.HasPrefix(name, metricAdmissionRqShed):
-			snap.shedTotal += value
+			snap.rqTotal += value
 		}
 	}
+	fmt.Printf("DEBUG parseMetrics: istioLines=%d rqTotal=%.0f\n", istioLines, snap.rqTotal)
 	return snap, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// extractLabel pulls a label value from a Prometheus line.
+// e.g. extractLabel(`metric{foo="bar",baz="qux"} 1`, "foo") → "bar"
+func extractLabel(line, key string) string {
+	search := key + `="`
+	idx := strings.Index(line, search)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(search)
+	end := strings.Index(line[start:], `"`)
+	if end < 0 {
+		return ""
+	}
+	return line[start : start+end]
+}
+
+// httpClass returns the HTTP status class (2, 3, 4, 5) from a status code string.
+func httpClass(code string) int {
+	if len(code) == 0 {
+		return 0
+	}
+	switch code[0] {
+	case '2':
+		return 2
+	case '3':
+		return 3
+	case '4':
+		return 4
+	case '5':
+		return 5
+	}
+	return 0
 }
 
 func parsePromLine(line string) (string, float64, bool) {

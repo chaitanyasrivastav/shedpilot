@@ -31,17 +31,15 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr    string
-		probeAddr      string
-		leaderElect    bool
-		istiodRTDSAddr string
-		enableRTDS     bool
+		metricsAddr string
+		probeAddr   string
+		leaderElect bool
+		enableRTDS  bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics endpoint address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe endpoint address")
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election (required for 2-replica HA)")
-	flag.StringVar(&istiodRTDSAddr, "istiod-rtds-address", rtds.IstiodRTDSAddress, "Istiod RTDS gRPC address")
 	flag.BoolVar(&enableRTDS, "enable-rtds", true, "Enable RTDS for sub-200ms profile switching")
 
 	opts := zap.Options{Development: false}
@@ -70,19 +68,22 @@ func main() {
 	ctx := ctrl.SetupSignalHandler()
 
 	// ── Wire RTDS client ──────────────────────────────────────────────────────
-
 	var rtdsClient *rtds.Client
+	restConfig, err := ctrl.GetConfig()
+	if err != nil {
+		setupLog.Error(err, "unable to get rest config")
+		os.Exit(1)
+	}
 	if enableRTDS {
-		rtdsClient = rtds.NewClient(istiodRTDSAddr)
-		if err := rtdsClient.Connect(ctx); err != nil {
-			// Non-fatal — operator runs without RTDS, falls back to EnvoyFilter path
-			setupLog.Error(err, "RTDS connection failed — profile switches will use EnvoyFilter path (5-30s delivery)",
-				"address", istiodRTDSAddr,
-			)
-			rtdsClient = nil
+		client, err := rtds.NewClient(restConfig, mgr.GetClient())
+		if err != nil {
+			setupLog.Error(err, "unable to create rtds client, falling back to EnvoyFilter path")
 		} else {
-			setupLog.Info("RTDS connected", "address", istiodRTDSAddr)
+			rtdsClient = client
+			setupLog.Info("fast delivery client ready (Envoy admin API)")
 		}
+	} else {
+		setupLog.Info("RTDS disabled — using EnvoyFilter path only")
 	}
 
 	// ── Register controller ───────────────────────────────────────────────────

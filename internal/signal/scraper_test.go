@@ -9,11 +9,11 @@ import (
 
 func TestParseMetrics_BasicCounters(t *testing.T) {
 	body := `
-# HELP envoy_cluster_upstream_rq_total Total upstream requests
-# TYPE envoy_cluster_upstream_rq_total counter
-envoy_cluster_upstream_rq_total{envoy_cluster_name="outbound|8080||payments.production.svc.cluster.local"} 12345
-envoy_cluster_upstream_rq_2xx{envoy_cluster_name="outbound|8080||payments.production.svc.cluster.local"} 11800
-envoy_cluster_upstream_rq_5xx{envoy_cluster_name="outbound|8080||payments.production.svc.cluster.local"} 545
+# HELP istio_requests_total Total requests
+# TYPE istio_requests_total counter
+istio_requests_total{destination_service_namespace="production",destination_service_name="payments",response_code="200"} 11800
+istio_requests_total{destination_service_namespace="production",destination_service_name="payments",response_code="500"} 545
+istio_requests_total{destination_service_namespace="production",destination_service_name="payments",response_code="200"} 100
 envoy_http_admission_control_requests_ejected{} 120
 `
 
@@ -22,11 +22,11 @@ envoy_http_admission_control_requests_ejected{} 120
 		t.Fatalf("parseMetrics() error = %v", err)
 	}
 
-	if snap.rqTotal != 12345 {
-		t.Errorf("rqTotal = %v, want 12345", snap.rqTotal)
+	if snap.rqTotal != 12445 {
+		t.Errorf("rqTotal = %v, want 12445", snap.rqTotal)
 	}
-	if snap.rq2xx != 11800 {
-		t.Errorf("rq2xx = %v, want 11800", snap.rq2xx)
+	if snap.rq2xx != 11900 {
+		t.Errorf("rq2xx = %v, want 11900", snap.rq2xx)
 	}
 	if snap.rq5xx != 545 {
 		t.Errorf("rq5xx = %v, want 545", snap.rq5xx)
@@ -61,19 +61,18 @@ func TestParseMetrics_CommentsOnly(t *testing.T) {
 }
 
 func TestParseMetrics_MultipleClusterAggregation(t *testing.T) {
-	// Multiple cluster labels should all be summed
+	// Multiple response codes should all be summed
 	body := `
-envoy_cluster_upstream_rq_total{envoy_cluster_name="cluster-a"} 1000
-envoy_cluster_upstream_rq_total{envoy_cluster_name="cluster-b"} 500
-envoy_cluster_upstream_rq_2xx{envoy_cluster_name="cluster-a"} 990
-envoy_cluster_upstream_rq_2xx{envoy_cluster_name="cluster-b"} 480
+istio_requests_total{destination_service="cluster-a",response_code="200"} 990
+istio_requests_total{destination_service="cluster-a",response_code="500"} 10
+istio_requests_total{destination_service="cluster-b",response_code="200"} 480
 `
 	snap, err := parseMetrics(body)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if snap.rqTotal != 1500 {
-		t.Errorf("rqTotal = %v, want 1500 (aggregated)", snap.rqTotal)
+	if snap.rqTotal != 1480 {
+		t.Errorf("rqTotal = %v, want 1480 (aggregated)", snap.rqTotal)
 	}
 	if snap.rq2xx != 1470 {
 		t.Errorf("rq2xx = %v, want 1470 (aggregated)", snap.rq2xx)

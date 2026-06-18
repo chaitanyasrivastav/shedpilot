@@ -38,6 +38,7 @@ import (
 // +kubebuilder:rbac:groups=resilience.shedpilot.io,resources=adaptivepolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=resilience.shedpilot.io,resources=adaptivepolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=networking.istio.io,resources=envoyfilters;destinationrules,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // AdaptivePolicyReconciler reconciles AdaptivePolicy objects.
@@ -62,9 +63,12 @@ type AdaptivePolicyReconciler struct {
 	// pollers holds one running Poller goroutine per AdaptivePolicy.
 	// Each poller scrapes at its configured PollInterval and emits debounced
 	// signals on confirmed breach/recovery. Protected by pollerMu.
-	pollerMu      sync.Mutex
-	pollers       map[string]*signal.Poller
-	pollerCancels map[string]context.CancelFunc
+	pollerMu          sync.Mutex
+	pollers           map[string]*signal.Poller
+	pollerCancels     map[string]context.CancelFunc
+	pollerGenerations map[string]int64
+
+	pollerScraper *signal.Scraper // poller scraper — separate from reconcile loop scraper to avoid mutex contention on previous signal values
 }
 
 // NewAdaptivePolicyReconciler creates a reconciler with all dependencies wired.
@@ -74,13 +78,15 @@ func NewAdaptivePolicyReconciler(
 	rtdsClient *rtds.Client,
 ) *AdaptivePolicyReconciler {
 	return &AdaptivePolicyReconciler{
-		Client:        c,
-		Scheme:        scheme,
-		scraper:       signal.NewScraper(c),
-		rtdsClient:    rtdsClient,
-		triggerState:  make(map[string]*trigger.State),
-		pollers:       make(map[string]*signal.Poller),
-		pollerCancels: make(map[string]context.CancelFunc),
+		Client:            c,
+		Scheme:            scheme,
+		scraper:           signal.NewScraper(c),
+		rtdsClient:        rtdsClient,
+		triggerState:      make(map[string]*trigger.State),
+		pollers:           make(map[string]*signal.Poller),
+		pollerCancels:     make(map[string]context.CancelFunc),
+		pollerGenerations: make(map[string]int64),
+		pollerScraper:     signal.NewScraper(c), // poller scraper — separate previous map
 	}
 }
 
@@ -164,6 +170,12 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				RPS:         0,
 				CollectedAt: time.Now(),
 			}
+		} else {
+			logger.Info("signal read",
+				"successRate", fmt.Sprintf("%.4f", signals.SuccessRate),
+				"rps", fmt.Sprintf("%.1f", signals.RPS),
+				"samples", signals.SampleCount,
+			)
 		}
 	}
 
@@ -225,6 +237,12 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	r.pruneOrphanedResources(ctx, policy, renderResult.ManagedResourceRefs)
 
 	// ── 7. RTDS push (sub-200ms delivery) ─────────────────────────────────────
+
+	if r.rtdsClient != nil {
+		for layerName := range renderResult.RTDSLayers {
+			r.rtdsClient.RegisterLayer(layerName, policy.Namespace, policy.Spec.Selector)
+		}
+	}
 
 	rtdsConnected := false
 	if profileSwitched && r.rtdsClient != nil && r.rtdsClient.Connected() && meshRenderer.RTDSSupported() {
@@ -313,6 +331,11 @@ func (r *AdaptivePolicyReconciler) evaluateAndSwitch(
 	signals trigger.Signals,
 	state *trigger.State,
 ) (trigger.Decision, bool, error) {
+
+	// Human override — freeze all automatic switching
+	if policy.IsHumanOverrideEnabled() {
+		return trigger.Decision{Reason: "human-override active — automatic switching frozen"}, false, nil
+	}
 
 	if !policy.HasTriggers() {
 		return trigger.Decision{Reason: "no triggers configured"}, false, nil
@@ -498,14 +521,23 @@ func (r *AdaptivePolicyReconciler) ensurePoller(key string, policy *v1alpha1.Ada
 	if r.pollers == nil {
 		r.pollers = make(map[string]*signal.Poller)
 		r.pollerCancels = make(map[string]context.CancelFunc)
+		r.pollerGenerations = make(map[string]int64)
 	}
 	if p, ok := r.pollers[key]; ok {
-		return p
+		// Check generation — restart Poller if spec.detection changed
+		if gen, ok := r.pollerGenerations[key]; ok && gen == policy.Generation {
+			return p
+		}
+		// Generation changed — cancel old Poller
+		if cancel, ok := r.pollerCancels[key]; ok {
+			cancel()
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := signal.NewPoller(r.scraper, policy, pollerConfig(policy.Spec.Detection))
+	p := signal.NewPoller(r.pollerScraper, policy, pollerConfig(policy.Spec.Detection))
 	r.pollers[key] = p
 	r.pollerCancels[key] = cancel
+	r.pollerGenerations[key] = policy.Generation
 	go p.Run(ctx)
 	return p
 }

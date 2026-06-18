@@ -875,7 +875,7 @@ type AdaptivePolicyStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=ap,scope=Namespaced,categories=shedpilot
+// +kubebuilder:resource:shortName=adp,scope=Namespaced,categories=shedpilot
 // +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=`.status.detectedBackend`
 // +kubebuilder:printcolumn:name="Profile",type=string,JSONPath=`.status.activeProfile`
 // +kubebuilder:printcolumn:name="DryRun",type=boolean,JSONPath=`.spec.dryRun`
