@@ -7,9 +7,20 @@
 ### Cluster and namespace
 
 ```bash
-kind create cluster --name shedpilot-test-e2e
+make setup-test-e2e
+istioctl install --set profile=demo -y
 kubectl create namespace shedpilot-test
 kubectl label namespace shedpilot-test istio-injection=enabled
+```
+
+### Operator deployment
+
+```bash
+make docker-build IMG=shedpilot:dev
+kind load docker-image shedpilot:dev --name shedpilot-test-e2e
+make deploy IMG=shedpilot:dev
+kubectl rollout restart deployment shedpilot-controller-manager -n shedpilot-system
+kubectl rollout status deployment/shedpilot-controller-manager -n shedpilot-system
 ```
 
 ### Test service
@@ -96,19 +107,6 @@ spec:
         ports:
         - containerPort: 80
 EOF
-```
-
-### Operator deployment
-
-```bash
-make docker-build IMG=shedpilot:dev
-kind load docker-image shedpilot:dev --name shedpilot-test-e2e
-make deploy IMG=$IMG
-# Patch imagePullPolicy to Never for local image
-kubectl patch deployment shedpilot-controller-manager \
-  -n shedpilot-system --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"}]'
-kubectl rollout status deployment/shedpilot-controller-manager -n shedpilot-system
 ```
 
 ### RBAC — fast delivery requires pods/exec

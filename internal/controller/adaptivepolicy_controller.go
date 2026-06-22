@@ -213,17 +213,19 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// ── 6. Apply ──────────────────────────────────────────────────────────────
 
-	for _, resource := range renderResult.Resources {
-		if err := r.Patch(ctx, resource, client.Apply,
-			client.FieldOwner("shedpilot"),
-			client.ForceOwnership,
-		); err != nil {
-			logger.Error(err, "apply failed",
-				"kind", resource.GetKind(),
-				"name", resource.GetName(),
-			)
-			_ = r.markDegraded(ctx, policy, "ApplyFailed", err.Error())
-			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	if !profileSwitched {
+		for _, resource := range renderResult.Resources {
+			if err := r.Patch(ctx, resource, client.Apply,
+				client.FieldOwner("shedpilot"),
+				client.ForceOwnership,
+			); err != nil {
+				logger.Error(err, "apply failed",
+					"kind", resource.GetKind(),
+					"name", resource.GetName(),
+				)
+				_ = r.markDegraded(ctx, policy, "ApplyFailed", err.Error())
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			}
 		}
 	}
 
@@ -248,13 +250,15 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if profileSwitched && r.rtdsClient != nil && r.rtdsClient.Connected() && meshRenderer.RTDSSupported() {
 		rtdsConnected = true
 		for layerName, values := range renderResult.RTDSLayers {
+			start := time.Now()
 			if err := r.rtdsClient.Push(ctx, layerName, values); err != nil {
 				// Non-fatal — EnvoyFilter re-render (step 6) already applied the change.
 				// RTDS is the fast path; EnvoyFilter is the reliable fallback.
 				logger.Error(err, "RTDS push failed, relying on EnvoyFilter path", "layer", layerName)
 				rtdsConnected = false
 			} else {
-				logger.Info("RTDS push succeeded", "layer", layerName, "deliveryMs", "<200")
+				deliveryMs := time.Since(start).Milliseconds()
+				logger.Info("RTDS push succeeded", "layer", layerName, "deliveryMs", deliveryMs)
 			}
 		}
 	}

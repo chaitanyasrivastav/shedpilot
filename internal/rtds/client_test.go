@@ -6,7 +6,7 @@ import (
 )
 
 func TestConnected_FalseBeforeConnect(t *testing.T) {
-	c, err := NewClient(nil, nil)
+	c, err := NewClient(nil)
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -16,7 +16,7 @@ func TestConnected_FalseBeforeConnect(t *testing.T) {
 }
 
 func TestPush_NotConnected_QueuesPending(t *testing.T) {
-	c, err := NewClient(nil, nil)
+	c, err := NewClient(nil)
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestPush_NotConnected_QueuesPending(t *testing.T) {
 }
 
 func TestPush_MultipleLayersQueued(t *testing.T) {
-	c, err := NewClient(nil, nil)
+	c, err := NewClient(nil)
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestPush_MultipleLayersQueued(t *testing.T) {
 }
 
 func TestPendingCount_Zero_WhenEmpty(t *testing.T) {
-	c, err := NewClient(nil, nil)
+	c, err := NewClient(nil)
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestPendingCount_Zero_WhenEmpty(t *testing.T) {
 }
 
 func TestClose_NotConnected_NoError(t *testing.T) {
-	c, err := NewClient(nil, nil)
+	c, err := NewClient(nil)
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}

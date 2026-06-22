@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/chaitanyasrivastav/shedpilot/api/v1alpha1"
+	"github.com/chaitanyasrivastav/shedpilot/internal/rtds"
 )
 
 const (
@@ -37,6 +38,11 @@ const (
 	labelManagedByVal = "shedpilot"
 	labelPolicy       = "resilience.shedpilot.io/policy"
 	labelPolicyNS     = "resilience.shedpilot.io/policy-namespace"
+
+	// rtdsServiceHost is the DNS name of the shedpilot RTDS service.
+	// Envoy sidecars connect here to receive runtime updates.
+	// Format: <service-name>.<namespace>.svc.cluster.local
+	rtdsServiceHost = "controller-manager-metrics-service.shedpilot-system.svc.cluster.local"
 )
 
 // IstioRenderer generates EnvoyFilter and DestinationRule resources for Istio.
@@ -325,15 +331,16 @@ func (r *IstioRenderer) renderStatsFlush(policy *v1alpha1.AdaptivePolicy) *unstr
 		"spec", "workloadSelector", "labels",
 	)
 
+	bootstrapValue := rtds.BootstrapPatch(rtdsServiceHost)
+	bootstrapValue["stats_flush_on_admin"] = true
+
 	_ = unstructured.SetNestedSlice(ef.Object,
 		[]interface{}{
 			map[string]interface{}{
 				"applyTo": "BOOTSTRAP",
 				"patch": map[string]interface{}{
 					"operation": "MERGE",
-					"value": map[string]interface{}{
-						"stats_flush_on_admin": true,
-					},
+					"value":     bootstrapValue,
 				},
 			},
 		},

@@ -63,11 +63,16 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --enable-rtds=true
+          - --rtds-port=15050
         image: controller:latest
         name: manager
         ports:
         - containerPort: 8081
           name: health
+          protocol: TCP
+        - containerPort: 15050
+          name: rtds-grpc
           protocol: TCP
         securityContext:
           readOnlyRootFilesystem: true

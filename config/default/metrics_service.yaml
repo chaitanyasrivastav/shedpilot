@@ -13,6 +13,10 @@ spec:
     port: 8443
     protocol: TCP
     targetPort: 8443
+  - name: rtds-grpc
+    port: 15050
+    protocol: TCP
+    targetPort: 15050
   selector:
     control-plane: controller-manager
     app.kubernetes.io/name: shedpilot

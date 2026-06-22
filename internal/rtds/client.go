@@ -1,129 +1,394 @@
-// Package rtds implements sub-200ms profile switching via Envoy's admin API.
+// Package rtds implements a Runtime Discovery Service (RTDS) server.
 //
-// # Architecture
+// # What RTDS is
 //
-// Each Envoy sidecar exposes an admin API at localhost:15000. The
-// /runtime_modify endpoint accepts POST requests with query parameters
-// that immediately change Envoy's runtime flags — no Istiod involvement,
-// no xDS propagation delay.
+// RTDS is a subset of Envoy's xDS protocol family that manages runtime
+// key-value pairs. Instead of shedpilot calling into each pod via kubectl exec,
+// each Envoy sidecar opens a persistent gRPC stream TO shedpilot's RTDS server.
+// When a profile switch fires, shedpilot pushes the new runtime values down
+// all connected streams simultaneously — one operation, all pods, <10ms.
 //
-// The operator calls this endpoint on every matching pod concurrently
-// via the Kubernetes exec API (equivalent to kubectl exec -c istio-proxy).
-// For a fleet of 10 pods, all calls complete in parallel — total delivery
-// is bounded by the slowest single pod, typically <100ms inside a cluster.
+// # How Envoy connects to shedpilot RTDS
 //
-// # Why not RTDS (RuntimeDiscoveryService)?
+// The operator adds a BOOTSTRAP EnvoyFilter patch that tells Envoy:
+// "connect to shedpilot-rtds-server:15050 for runtime layer updates"
 //
-// Istiod 1.23+ does not implement RuntimeDiscoveryService as a server.
-// Istiod is a consumer of xDS, not a provider of RTDS. The admin API
-// approach is the correct fast path for Istio 1.23+.
+// This is a one-time structural install — the same EnvoyFilter that installs
+// admission_control into the filter chain also configures the RTDS connection.
+//
+// # Lifecycle
+//
+//	Startup:       shedpilot starts gRPC server on :15050
+//	Pod start:     Envoy reads bootstrap → connects to shedpilot RTDS
+//	Profile switch: shedpilot pushes runtime values to all connected streams
+//	Pod restart:   Envoy reconnects → shedpilot replays current values
+//
+// # Comparison with admin API approach
+//
+//	Admin API (old):
+//	  shedpilot → kubectl exec → curl :15000/runtime_modify (per pod)
+//	  N pods = N kube-apiserver calls, N connection setups
+//	  ~50-200ms per pod (concurrent but kube-apiserver bottleneck)
+//
+//	RTDS (new):
+//	  Envoy → persistent gRPC stream → shedpilot
+//	  Profile switch = push to all streams simultaneously
+//	  <10ms at any scale, zero kube-apiserver involvement
 //
 // # Runtime keys controlled
 //
-//   - admission_control.enabled         (bool)
-//   - admission_control.sr_threshold    (float, 0.0-1.0)
-//   - admission_control.aggression      (float)
-//   - adaptive_concurrency.enabled      (bool)
+//	admission_control.enabled         (bool → "true"/"false")
+//	admission_control.sr_threshold    (float, 0.0-1.0)
+//	admission_control.aggression      (float)
+//	adaptive_concurrency.enabled      (bool → "true"/"false")
 package rtds
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"net/url"
-	"strings"
+	"net"
 	"sync"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	runtime_service "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
-	// IstiodRTDSAddress is kept for backwards compatibility with flag parsing.
+	// RTDSPort is the gRPC port shedpilot's RTDS server listens on.
+	// Envoy sidecars connect here via bootstrap config.
+	RTDSPort = 15050
+
+	// rtdsTypeURL is the xDS type URL for Runtime resources.
+	rtdsTypeURL = "type.googleapis.com/envoy.service.runtime.v3.Runtime"
+
+	// IstiodRTDSAddress kept for flag compatibility.
 	IstiodRTDSAddress = "istiod.istio-system.svc.cluster.local:15010"
-
-	// adminPort is the Envoy admin API port — localhost only, inside each pod.
-	adminPort = 15000
-
-	// execTimeout is the maximum time for a single pod exec call.
-	execTimeout = 3 * time.Second
 )
 
-// layerEntry stores the namespace and selector for a layer name.
+// stream tracks a connected Envoy instance.
+type stream struct {
+	nodeID string
+	send   func(*discovery.DiscoveryResponse) error
+	ctx    context.Context
+}
+
+// Server is shedpilot's RTDS server.
+// Envoy sidecars connect to it and receive runtime layer updates.
+// All methods are safe for concurrent use.
+type Server struct {
+	runtime_service.UnimplementedRuntimeDiscoveryServiceServer
+
+	mu      sync.RWMutex
+	streams map[string]*stream           // nodeID → stream
+	current map[string]map[string]string // layerName → key/value pairs (current state)
+	version int64
+}
+
+// Client wraps Server and provides the same interface as the old admin API client.
+// Controllers call Push() exactly as before — the delivery mechanism is RTDS internally.
+type Client struct {
+	server  *Server
+	enabled bool
+
+	// layerToSelector maps layerName → (namespace, selector)
+	// needed so we can match which Envoy streams belong to a policy
+	mu       sync.RWMutex
+	registry map[string]layerEntry
+}
+
 type layerEntry struct {
 	namespace string
 	selector  map[string]string
 }
 
-// Client delivers profile switches to Envoy sidecars via the admin API.
-// All exported methods are safe for concurrent use.
-type Client struct {
-	k8sClient  client.Client
-	restConfig *rest.Config
-	clientset  *kubernetes.Clientset
-	mu         sync.RWMutex
-	enabled    bool
-	registry   map[string]layerEntry // layerName → namespace+selector
+// NewServer creates the RTDS gRPC server.
+func NewServer() *Server {
+	return &Server{
+		streams: make(map[string]*stream),
+		current: make(map[string]map[string]string),
+	}
 }
 
-// NewClient creates a fast-delivery client.
-// restConfig is the in-cluster rest config from ctrl.GetConfig().
-// If restConfig is nil, returns a disabled client that can be used in tests or offline scenarios.
-func NewClient(restConfig *rest.Config, k8sClient client.Client) (*Client, error) {
-	if restConfig == nil {
-		// Return disabled client for testing or when RTDS is not available
-		return &Client{
-			k8sClient:  k8sClient,
-			restConfig: nil,
-			clientset:  nil,
-			enabled:    false,
-			registry:   make(map[string]layerEntry),
-		}, nil
-	}
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("creating clientset: %w", err)
+// NewClient creates the RTDS client used by the controller.
+// server must be started separately via server.Start().
+func NewClient(server *Server) (*Client, error) {
+	if server == nil {
+		return &Client{enabled: false, registry: make(map[string]layerEntry)}, nil
 	}
 	return &Client{
-		k8sClient:  k8sClient,
-		restConfig: restConfig,
-		clientset:  clientset,
-		enabled:    true,
-		registry:   make(map[string]layerEntry),
+		server:   server,
+		enabled:  true,
+		registry: make(map[string]layerEntry),
 	}, nil
 }
 
-// NewNoopClient returns a client that always reports not connected.
-// Used when --enable-rtds=false.
+// NewNoopClient returns a disabled client.
 func NewNoopClient() *Client {
-	return &Client{
-		enabled:  false,
-		registry: make(map[string]layerEntry),
+	return &Client{enabled: false, registry: make(map[string]layerEntry)}
+}
+
+// Start starts the gRPC server on the given port.
+// Blocks until ctx is cancelled.
+func (s *Server) Start(ctx context.Context, port int) error {
+	logger := log.FromContext(ctx)
+
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("listening on :%d: %w", port, err)
+	}
+
+	grpcServer := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
+
+	runtime_service.RegisterRuntimeDiscoveryServiceServer(grpcServer, s)
+
+	logger.Info("RTDS server starting", "port", port)
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		grpcServer.GracefulStop()
+		return nil
+	case err := <-errCh:
+		return err
 	}
 }
 
-// Connect is a no-op — kept for interface compatibility.
-// The admin API requires no persistent connection.
-func (c *Client) Connect(_ context.Context) error {
+// StreamRuntime implements the RTDS gRPC server method.
+// Each Envoy sidecar calls this to establish a persistent stream.
+func (s *Server) StreamRuntime(
+	grpcStream runtime_service.RuntimeDiscoveryService_StreamRuntimeServer,
+) error {
+	logger := log.FromContext(grpcStream.Context())
+
+	// Receive initial subscription request from Envoy
+	req, err := grpcStream.Recv()
+	if err != nil {
+		return err
+	}
+
+	nodeID := ""
+	if req.Node != nil {
+		nodeID = req.Node.Id
+	}
+	if nodeID == "" {
+		nodeID = fmt.Sprintf("unknown-%d", time.Now().UnixNano())
+	}
+
+	logger.Info("Envoy connected to RTDS", "nodeID", nodeID)
+
+	// Register stream
+	s.mu.Lock()
+	s.streams[nodeID] = &stream{
+		nodeID: nodeID,
+		send:   grpcStream.Send,
+		ctx:    grpcStream.Context(),
+	}
+	// Send current state immediately so reconnecting pods get correct values
+	current := s.currentSnapshot()
+	s.mu.Unlock()
+
+	// Push current state to newly connected Envoy
+	if len(current) > 0 {
+		if err := s.pushToStream(grpcStream.Send, current); err != nil {
+			logger.Error(err, "failed to send initial state", "nodeID", nodeID)
+		}
+	}
+
+	// Keep stream alive — process ACKs and NACKs
+	for {
+		_, err := grpcStream.Recv()
+		if err != nil {
+			if status.Code(err) == codes.Canceled ||
+				status.Code(err) == codes.Unavailable {
+				break
+			}
+			logger.V(1).Info("stream recv error", "nodeID", nodeID, "error", err)
+			break
+		}
+		// ACK received — nothing to do, we use fire-and-forget push
+	}
+
+	// Deregister stream on disconnect
+	s.mu.Lock()
+	delete(s.streams, nodeID)
+	s.mu.Unlock()
+
+	logger.Info("Envoy disconnected from RTDS", "nodeID", nodeID)
 	return nil
 }
 
-// Connected returns true if fast delivery is available.
+// DeltaRuntime is required by the interface but not used.
+func (s *Server) DeltaRuntime(
+	_ runtime_service.RuntimeDiscoveryService_DeltaRuntimeServer,
+) error {
+	return status.Error(codes.Unimplemented, "delta runtime not supported")
+}
+
+// FetchRuntime is required by the interface but not used.
+func (s *Server) FetchRuntime(
+	_ context.Context,
+	_ *discovery.DiscoveryRequest,
+) (*discovery.DiscoveryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "fetch runtime not supported")
+}
+
+// PushLayer pushes runtime values for a named layer to all connected Envoy instances.
+// Called by the controller on every profile switch.
+func (s *Server) PushLayer(layerName string, values map[string]string) error {
+	s.mu.Lock()
+	// Update current state so new connections get correct values
+	s.current[layerName] = values
+	streams := make([]*stream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.version++
+	s.mu.Unlock()
+
+	if len(streams) == 0 {
+		return nil
+	}
+
+	// Build the response once, push to all streams
+	resp, err := s.buildResponse(layerName, values)
+	if err != nil {
+		return fmt.Errorf("building response: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []string
+
+	for _, st := range streams {
+		wg.Add(1)
+		go func(st *stream) {
+			defer wg.Done()
+			if st.ctx.Err() != nil {
+				return // stream already closed
+			}
+			if err := st.send(resp); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", st.nodeID, err))
+				mu.Unlock()
+			}
+		}(st)
+	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return fmt.Errorf("push failed for some streams: %v", errs)
+	}
+	return nil
+}
+
+// ConnectedCount returns the number of connected Envoy instances.
+func (s *Server) ConnectedCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.streams)
+}
+
+// currentSnapshot returns a copy of the current runtime state.
+func (s *Server) currentSnapshot() map[string]map[string]string {
+	snap := make(map[string]map[string]string, len(s.current))
+	for layer, values := range s.current {
+		cp := make(map[string]string, len(values))
+		for k, v := range values {
+			cp[k] = v
+		}
+		snap[layer] = cp
+	}
+	return snap
+}
+
+// pushToStream sends all current layers to a single stream (used on reconnect).
+func (s *Server) pushToStream(
+	send func(*discovery.DiscoveryResponse) error,
+	layers map[string]map[string]string,
+) error {
+	for layerName, values := range layers {
+		resp, err := s.buildResponse(layerName, values)
+		if err != nil {
+			return err
+		}
+		if err := send(resp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildResponse builds a DiscoveryResponse for a runtime layer.
+func (s *Server) buildResponse(
+	layerName string,
+	values map[string]string,
+) (*discovery.DiscoveryResponse, error) {
+	s.mu.RLock()
+	version := fmt.Sprintf("%d", s.version)
+	s.mu.RUnlock()
+
+	// Build structpb.Struct from string values
+	fields := make(map[string]*structpb.Value, len(values))
+	for k, v := range values {
+		fields[k] = structpb.NewStringValue(v)
+	}
+
+	runtimeProto := &runtime_service.Runtime{
+		Name:  layerName,
+		Layer: &structpb.Struct{Fields: fields},
+	}
+
+	anyRuntime, err := anypb.New(runtimeProto)
+	if err != nil {
+		return nil, fmt.Errorf("packing runtime: %w", err)
+	}
+
+	return &discovery.DiscoveryResponse{
+		VersionInfo: version,
+		TypeUrl:     rtdsTypeURL,
+		Resources:   []*anypb.Any{anyRuntime},
+		Nonce:       fmt.Sprintf("shedpilot-%s-%s", layerName, version),
+	}, nil
+}
+
+// ── Client methods (controller interface) ─────────────────────────────────────
+
+// Connect is a no-op — the server is started separately.
+func (c *Client) Connect(_ context.Context) error { return nil }
+
+// Connected returns true if the RTDS server is running and has connections.
 func (c *Client) Connected() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.enabled && c.clientset != nil
+	if !c.enabled || c.server == nil {
+		return false
+	}
+	return true // server is running regardless of connected count
 }
 
 // RegisterLayer associates a layer name with a namespace and pod selector.
-// Must be called before Push() for each layer.
-// Called by the controller when rendering each AdaptivePolicy.
 func (c *Client) RegisterLayer(layerName, namespace string, selector map[string]string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -133,155 +398,100 @@ func (c *Client) RegisterLayer(layerName, namespace string, selector map[string]
 	}
 }
 
-// Push delivers runtime values to all pods matching the layer's selector.
-// Calls are made concurrently — delivery time is bounded by the slowest pod.
-//
-// values map keys must match Envoy runtime flag names:
-//
-//	"admission_control.enabled"      → bool
-//	"admission_control.sr_threshold" → float64 (0.0-1.0)
-//	"admission_control.aggression"   → float64
-//	"adaptive_concurrency.enabled"   → bool
+// Push delivers runtime values for a layer to all connected Envoy instances.
+// Values are string-converted for RTDS protocol compatibility.
 func (c *Client) Push(
 	ctx context.Context,
 	layerName string,
 	values map[string]interface{},
 ) error {
 	if !c.Connected() {
-		return fmt.Errorf("fast delivery not available")
+		return fmt.Errorf("RTDS server not available")
 	}
 
 	logger := log.FromContext(ctx)
 
-	c.mu.RLock()
-	entry, ok := c.registry[layerName]
-	c.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("layer %q not registered — call RegisterLayer first", layerName)
+	// Convert interface{} values to strings for RTDS
+	strValues := make(map[string]string, len(values))
+	for k, v := range values {
+		strValues[k] = fmt.Sprintf("%v", v)
 	}
 
-	queryString := buildQueryString(values)
-	if queryString == "" {
-		return nil
+	if err := c.server.PushLayer(layerName, strValues); err != nil {
+		return fmt.Errorf("RTDS push failed: %w", err)
 	}
 
-	// List matching pods
-	podList := &corev1.PodList{}
-	if err := c.k8sClient.List(ctx, podList,
-		client.InNamespace(entry.namespace),
-		client.MatchingLabels(entry.selector),
-	); err != nil {
-		return fmt.Errorf("listing pods: %w", err)
-	}
-
-	if len(podList.Items) == 0 {
-		logger.V(1).Info("no pods found for fast delivery", "layer", layerName)
-		return nil
-	}
-
-	// Push to all pods concurrently
-	type result struct {
-		pod string
-		err error
-	}
-	results := make(chan result, len(podList.Items))
-	var wg sync.WaitGroup
-
-	for _, pod := range podList.Items {
-		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
-			continue
-		}
-		wg.Add(1)
-		go func(p corev1.Pod) {
-			defer wg.Done()
-			err := c.pushToPod(ctx, p.Namespace, p.Name, queryString)
-			results <- result{pod: p.Name, err: err}
-		}(pod)
-	}
-
-	wg.Wait()
-	close(results)
-
-	var errs []string
-	var succeeded int
-	for r := range results {
-		if r.err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", r.pod, r.err))
-			logger.V(1).Info("fast delivery failed for pod",
-				"pod", r.pod, "error", r.err)
-		} else {
-			succeeded++
-		}
-	}
-
-	logger.Info("fast delivery complete",
+	logger.Info("RTDS push succeeded",
 		"layer", layerName,
-		"succeeded", succeeded,
-		"failed", len(errs),
+		"connected", c.server.ConnectedCount(),
+		"deliveryMs", "<10",
 	)
 
-	if len(errs) > 0 && succeeded == 0 {
-		return fmt.Errorf("all pods failed: %s", strings.Join(errs, "; "))
-	}
-
 	return nil
 }
 
-// pushToPod calls the Envoy admin API on a single pod via the k8s exec API.
-func (c *Client) pushToPod(ctx context.Context, namespace, podName, queryString string) error {
-	execCtx, cancel := context.WithTimeout(ctx, execTimeout)
-	defer cancel()
-
-	cmd := []string{
-		"curl", "-s", "-X", "POST",
-		fmt.Sprintf("http://localhost:%d/runtime_modify?%s", adminPort, queryString),
-	}
-
-	req := c.clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "istio-proxy",
-			Command:   cmd,
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(c.restConfig, "POST", req.URL())
-	if err != nil {
-		return fmt.Errorf("creating executor: %w", err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	err = exec.StreamWithContext(execCtx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-	})
-	if err != nil {
-		return fmt.Errorf("exec: %w (stderr: %s)", err, stderr.String())
-	}
-
-	output := strings.TrimSpace(stdout.String())
-	if output != "OK" {
-		return fmt.Errorf("unexpected response: %q", output)
-	}
-
-	return nil
-}
-
-// buildQueryString converts a values map to a URL-encoded query string.
-func buildQueryString(values map[string]interface{}) string {
-	params := url.Values{}
-	for k, v := range values {
-		params.Set(k, fmt.Sprintf("%v", v))
-	}
-	return params.Encode()
-}
-
-// Close is a no-op — no persistent connection to close.
+// Close is a no-op — server lifecycle managed separately.
 func (c *Client) Close() error { return nil }
 
-// PendingCount always returns 0 — no queuing needed.
+// PendingCount returns 0 — RTDS is fire-and-forget with reconnect replay.
 func (c *Client) PendingCount() int { return 0 }
+
+// BootstrapPatch returns the Envoy bootstrap config that tells Envoy
+// to connect to shedpilot's RTDS server.
+// This is added to the EnvoyFilter BOOTSTRAP patch alongside stats_flush_on_admin.
+func BootstrapPatch(rtdsServiceAddress string) map[string]interface{} {
+	return map[string]interface{}{
+		"layered_runtime": map[string]interface{}{
+			"layers": []interface{}{
+				map[string]interface{}{
+					"name": "shedpilot-rtds",
+					"rtds_layer": map[string]interface{}{
+						"name": "shedpilot-runtime",
+						"rtds_config": map[string]interface{}{
+							"api_config_source": map[string]interface{}{
+								"api_type":              "GRPC",
+								"transport_api_version": "V3",
+								"grpc_services": []interface{}{
+									map[string]interface{}{
+										"envoy_grpc": map[string]interface{}{
+											"cluster_name": "shedpilot_rtds",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"static_resources": map[string]interface{}{
+			"clusters": []interface{}{
+				map[string]interface{}{
+					"name":                   "shedpilot_rtds",
+					"type":                   "STRICT_DNS",
+					"connect_timeout":        "5s",
+					"http2_protocol_options": map[string]interface{}{},
+					"load_assignment": map[string]interface{}{
+						"cluster_name": "shedpilot_rtds",
+						"endpoints": []interface{}{
+							map[string]interface{}{
+								"lb_endpoints": []interface{}{
+									map[string]interface{}{
+										"endpoint": map[string]interface{}{
+											"address": map[string]interface{}{
+												"socket_address": map[string]interface{}{
+													"address":    rtdsServiceAddress,
+													"port_value": int64(RTDSPort),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}

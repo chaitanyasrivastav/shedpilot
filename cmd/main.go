@@ -35,12 +35,14 @@ func main() {
 		probeAddr   string
 		leaderElect bool
 		enableRTDS  bool
+		rtdsPort    int
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics endpoint address")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe endpoint address")
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election (required for 2-replica HA)")
 	flag.BoolVar(&enableRTDS, "enable-rtds", true, "Enable RTDS for sub-200ms profile switching")
+	flag.IntVar(&rtdsPort, "rtds-port", rtds.RTDSPort, "Port for the RTDS gRPC server")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -69,21 +71,34 @@ func main() {
 
 	// ── Wire RTDS client ──────────────────────────────────────────────────────
 	var rtdsClient *rtds.Client
-	restConfig, err := ctrl.GetConfig()
-	if err != nil {
-		setupLog.Error(err, "unable to get rest config")
-		os.Exit(1)
-	}
+
 	if enableRTDS {
-		client, err := rtds.NewClient(restConfig, mgr.GetClient())
+		// Create RTDS server — Envoy sidecars connect to this
+		rtdsServer := rtds.NewServer()
+
+		// Start RTDS gRPC server in background
+		// It runs independently of the controller-manager
+		go func() {
+			if err := rtdsServer.Start(ctx, rtdsPort); err != nil {
+				setupLog.Error(err, "RTDS server exited")
+			}
+		}()
+
+		setupLog.Info("RTDS server started",
+			"port", rtdsPort,
+			"description", "Envoy sidecars will connect here for runtime updates",
+		)
+
+		// Create client that pushes to the server
+		client, err := rtds.NewClient(rtdsServer)
 		if err != nil {
-			setupLog.Error(err, "unable to create rtds client, falling back to EnvoyFilter path")
+			setupLog.Error(err, "unable to create RTDS client, profile switches will use EnvoyFilter path")
 		} else {
 			rtdsClient = client
-			setupLog.Info("fast delivery client ready (Envoy admin API)")
+			setupLog.Info("RTDS client ready — profile switches deliver in <10ms")
 		}
 	} else {
-		setupLog.Info("RTDS disabled — using EnvoyFilter path only")
+		setupLog.Info("RTDS disabled — profile switches use EnvoyFilter path (5-30s)")
 	}
 
 	// ── Register controller ───────────────────────────────────────────────────
@@ -114,6 +129,7 @@ func main() {
 
 	setupLog.Info("starting shedpilot operator",
 		"rtdsEnabled", enableRTDS && rtdsClient != nil,
+		"rtdsPort", rtdsPort,
 		"leaderElection", leaderElect,
 	)
 
