@@ -120,26 +120,12 @@ func (s *Scraper) ReadSignals(
 
 		current, err := s.scrapePod(ctx, pod.Status.PodIP)
 		if err != nil {
+			log.FromContext(ctx).V(1).Info("pod scrape failed", "pod", pod.Name, "error", err)
 			continue
 		}
-		// TEMPORARY DEBUG — remove after fixing
-		log.FromContext(ctx).Info("pod scrape",
-			"pod", pod.Name,
-			"rqTotal", current.rqTotal,
-			"rq2xx", current.rq2xx,
-			"rq5xx", current.rq5xx,
-			"shedTotal", current.shedTotal,
-		)
 
 		prev, hasPrev := s.previous[pod.Name]
 		s.previous[pod.Name] = current
-		// ADD THIS:
-		log.FromContext(ctx).Info("prev check",
-			"pod", pod.Name,
-			"hasPrev", hasPrev,
-			"prevTotal", prev.rqTotal,
-			"currTotal", current.rqTotal,
-		)
 
 		if !hasPrev {
 			continue
@@ -154,14 +140,6 @@ func (s *Scraper) ReadSignals(
 		if rqDelta < 0 {
 			continue // counter reset on pod restart
 		}
-		// ADD THIS:
-		log.FromContext(ctx).Info("delta",
-			"pod", pod.Name,
-			"prevTotal", prev.rqTotal,
-			"currTotal", current.rqTotal,
-			"delta", rqDelta,
-			"intervalSecs", current.scrapedAt.Sub(prev.scrapedAt).Seconds(),
-		)
 
 		// Compute success delta using per-class deltas and successCodes config.
 		// This matches what admission_control filter measures internally.
@@ -242,12 +220,7 @@ func (s *Scraper) scrapePod(ctx context.Context, podIP string) (counterSnapshot,
 
 func parseMetrics(body string) (counterSnapshot, error) {
 	snap := counterSnapshot{scrapedAt: time.Now()}
-	var istioLines int
 	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "istio_requests_total{") {
-			istioLines++
-			fmt.Printf("DEBUG istio line: %q\n", line[:min(len(line), 100)])
-		}
 		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -284,15 +257,7 @@ func parseMetrics(body string) (counterSnapshot, error) {
 			snap.rqTotal += value
 		}
 	}
-	fmt.Printf("DEBUG parseMetrics: istioLines=%d rqTotal=%.0f\n", istioLines, snap.rqTotal)
 	return snap, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // extractLabel pulls a label value from a Prometheus line.

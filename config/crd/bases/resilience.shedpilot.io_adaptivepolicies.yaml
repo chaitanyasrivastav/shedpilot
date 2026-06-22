@@ -192,6 +192,29 @@ spec:
                       SheddingSpeed controls the shedding curve shape.
                       1.0=linear, 1.5=moderate (recommended), 2.0=aggressive.
                     type: string
+                  skipPaths:
+                    description: |-
+                      SkipPaths is a list of URL path prefixes that bypass admission control.
+                      Requests whose path starts with any entry are allowed through immediately,
+                      regardless of the current success rate.
+
+                      Primary use: Kubernetes liveness and readiness probe endpoints. Without
+                      skip paths, active shedding can reject health probes → kubelet marks the
+                      pod unhealthy → pod is killed → cascading failure under the load you were
+                      trying to shed.
+
+                      Note: Istio rewrites kubelet probes to port 15021 by default (on since 1.4).
+                      SkipPaths is only needed if you disabled Istio probe rewriting, expose health
+                      probes on the service port directly, or use Cilium.
+
+                      Paths are matched as prefixes: "/healthz" matches "/healthz" and "/healthz/ready".
+                      Matched paths receive an immediate 200 OK from Envoy; they do not reach the service.
+                      Do NOT include /metrics here — use a separate port for Prometheus scraping instead.
+
+                      Recommended: ["/healthz", "/readyz", "/livez"]
+                    items:
+                      type: string
+                    type: array
                   successCodes:
                     description: |-
                       SuccessCodes defines which HTTP status codes count as success.

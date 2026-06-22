@@ -26,6 +26,11 @@ const (
 	typeURLAdmissionControl    = "type.googleapis.com/envoy.extensions.filters.http.admission_control.v3.AdmissionControl"
 	typeURLAdaptiveConcurrency = "type.googleapis.com/envoy.extensions.filters.http.adaptive_concurrency.v3.AdaptiveConcurrency"
 
+	// Envoy proto type URLs for per-route typed_per_filter_config overrides.
+	// These disable the filter on a specific route (e.g. health check paths).
+	typeURLAdmissionControlPerRoute    = "type.googleapis.com/envoy.extensions.filters.http.admission_control.v3.AdmissionControlPerRoute"
+	typeURLAdaptiveConcurrencyPerRoute = "type.googleapis.com/envoy.extensions.filters.http.adaptive_concurrency.v3.AdaptiveConcurrencyPerRoute"
+
 	// RTDS runtime keys — these match the runtime_key fields in the filter config.
 	// Changing these values via RTDS updates filter behaviour without re-rendering.
 	rtdsKeyAdmissionEnabled    = "admission_control.enabled"
@@ -137,6 +142,20 @@ func (r *IstioRenderer) Render(policy *v1alpha1.AdaptivePolicy) (*RenderResult, 
 			APIVersion: istioNetworkingAPIVersion,
 			Kind:       "EnvoyFilter",
 			Name:       statsFlushName(policy),
+			Namespace:  policy.Namespace,
+		})
+	}
+
+	// Layer 2.5 — skip-paths (health probe bypass for admission_control)
+	// Must be rendered whenever admission_control is active and skipPaths is set.
+	// Uses INSERT_FIRST HTTP_ROUTE patches so health probes are never shed.
+	if policy.HasAdmissionControl() && len(policy.Spec.AdmissionControl.SkipPaths) > 0 {
+		ef := r.renderSkipPaths(policy, context)
+		result.Resources = append(result.Resources, ef)
+		result.ManagedResourceRefs = append(result.ManagedResourceRefs, v1alpha1.ManagedResource{
+			APIVersion: istioNetworkingAPIVersion,
+			Kind:       "EnvoyFilter",
+			Name:       skipPathsName(policy),
 			Namespace:  policy.Namespace,
 		})
 	}
@@ -386,6 +405,72 @@ func (r *IstioRenderer) renderStreamingProtection(
 	return dr, nil
 }
 
+// renderSkipPaths generates an EnvoyFilter that bypasses admission_control and
+// adaptive_concurrency for each path in cfg.SkipPaths.
+//
+// Each skip path gets an INSERT_FIRST HTTP_ROUTE patch that:
+//   - matches the path prefix
+//   - disables both filters via typed_per_filter_config
+//   - returns 200 OK directly from Envoy (no cluster reference needed)
+//
+// The direct_response is correct for liveness probes: if Envoy can respond,
+// the pod is alive. It also keeps the pod in the LB pool during shedding —
+// removing it via readiness would shift load to remaining pods and worsen the spike.
+func (r *IstioRenderer) renderSkipPaths(
+	policy *v1alpha1.AdaptivePolicy,
+	listenerContext string,
+) *unstructured.Unstructured {
+
+	cfg := policy.Spec.AdmissionControl
+
+	ef := &unstructured.Unstructured{}
+	ef.SetAPIVersion(istioNetworkingAPIVersion)
+	ef.SetKind("EnvoyFilter")
+	ef.SetName(skipPathsName(policy))
+	ef.SetNamespace(policy.Namespace)
+	ef.SetLabels(r.resourceLabels(policy))
+	ef.SetOwnerReferences(ownerReferences(policy))
+
+	_ = unstructured.SetNestedStringMap(ef.Object,
+		policy.Spec.Selector,
+		"spec", "workloadSelector", "labels",
+	)
+
+	patches := make([]interface{}, 0, len(cfg.SkipPaths))
+	for _, path := range cfg.SkipPaths {
+		patches = append(patches, map[string]interface{}{
+			"applyTo": "HTTP_ROUTE",
+			"match": map[string]interface{}{
+				"context": listenerContext,
+			},
+			"patch": map[string]interface{}{
+				"operation": "INSERT_FIRST",
+				"value": map[string]interface{}{
+					"match": map[string]interface{}{
+						"prefix": path,
+					},
+					"direct_response": map[string]interface{}{
+						"status": int64(200),
+					},
+					"typed_per_filter_config": map[string]interface{}{
+						filterNameAdmissionControl: map[string]interface{}{
+							"@type":    typeURLAdmissionControlPerRoute,
+							"disabled": true,
+						},
+						filterNameAdaptiveConcurrency: map[string]interface{}{
+							"@type":    typeURLAdaptiveConcurrencyPerRoute,
+							"disabled": true,
+						},
+					},
+				},
+			},
+		})
+	}
+
+	_ = unstructured.SetNestedSlice(ef.Object, patches, "spec", "configPatches")
+	return ef
+}
+
 // buildEnvoyFilter constructs an EnvoyFilter unstructured object.
 func (r *IstioRenderer) buildEnvoyFilter(
 	policy *v1alpha1.AdaptivePolicy,
@@ -471,6 +556,10 @@ func streamingProtectionName(policy *v1alpha1.AdaptivePolicy) string {
 
 func statsFlushName(policy *v1alpha1.AdaptivePolicy) string {
 	return fmt.Sprintf("%s-stats-flush", policy.Name)
+}
+
+func skipPathsName(policy *v1alpha1.AdaptivePolicy) string {
+	return fmt.Sprintf("%s-skip-paths", policy.Name)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

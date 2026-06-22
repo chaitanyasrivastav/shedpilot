@@ -25,7 +25,7 @@ shedpilot detects the aggregate cluster-wide signal and applies a coordinated re
 | | Raw EnvoyFilter | Istio circuit breaker | shedpilot |
 |---|---|---|---|
 | Detection latency | Manual | 0–10s (per-host) | **~3s cluster-wide** |
-| Profile switch speed | 5–30s | In-process | **<200ms via admin API** |
+| Profile switch speed | 5–30s | In-process | **<10ms via RTDS gRPC** |
 | Cluster-wide overload | ✗ | ✗ | ✅ |
 | Graduated response | ✗ | ✗ | ✅ normal→degraded→critical |
 | Signal collection | Manual Prometheus | Built-in | Built-in — no Prometheus needed |
@@ -72,9 +72,9 @@ Detection latency in testing on Istio 1.30: **~3 seconds end-to-end** (3 × 500m
 
 ### Profile switching
 
-When a trigger fires, the profile change is delivered to every matching pod's Envoy sidecar via the Envoy admin API (`localhost:15000/runtime_modify`). All pods are called concurrently. Delivery is bounded by the slowest single pod — typically under 200ms inside a cluster.
+When a trigger fires, the profile change is delivered via shedpilot's built-in RTDS (Runtime Discovery Service) gRPC server. Each Envoy sidecar opens a persistent gRPC stream to shedpilot at startup — one push from shedpilot reaches all connected sidecars simultaneously in under 10ms. No kube-apiserver involvement, no per-pod connection setup.
 
-The EnvoyFilter re-render path (5–30s via standard xDS) runs in parallel as the reliable fallback — if fast delivery fails for any pod, the EnvoyFilter ensures eventual consistency.
+The EnvoyFilter re-render path (5–30s via standard xDS) runs in parallel as the reliable fallback — if a sidecar is not yet connected to RTDS (e.g. during startup), the EnvoyFilter ensures eventual consistency.
 
 ### Reconcile loop
 
@@ -293,7 +293,7 @@ Rendered as an Istio `DestinationRule.connectionPool`. Provides static connectio
 | Spike starts | T+0s |
 | 3 consecutive breach confirmations (3 × 500ms) | T+1.5s |
 | Reconcile triggered | T+1.5–2s |
-| Fast delivery to all sidecars via admin API | T+2–3s |
+| Fast delivery to all sidecars via RTDS | T+2s |
 | **Total: normal → critical** | **~3 seconds** |
 | Recovery: critical → normal after traffic restored | **~10 seconds** |
 
@@ -301,13 +301,20 @@ These are real numbers from end-to-end testing, not theoretical claims.
 
 ### How fast delivery works
 
-When a trigger fires, shedpilot calls `POST localhost:15000/runtime_modify` on every matching pod's `istio-proxy` container concurrently via the Kubernetes exec API. This bypasses Istiod entirely — no xDS propagation, no CRD watch latency. Each call takes ~50–150ms inside a cluster. With 10 pods, all calls run in parallel and complete in under 200ms.
+shedpilot runs its own RTDS (Runtime Discovery Service) gRPC server on port 15050. Each Envoy sidecar connects to it at startup via a `BOOTSTRAP` EnvoyFilter patch installed automatically by the operator. The connection is a persistent bidirectional gRPC stream.
 
-The EnvoyFilter re-render (5–30s via standard xDS) runs in parallel as a reliable fallback. If fast delivery fails for any reason, the EnvoyFilter ensures the config change eventually reaches all proxies.
+When a profile switch fires:
+1. shedpilot updates the runtime layer in memory
+2. Pushes the new values to all connected streams simultaneously — one operation, all pods
+3. Envoy applies the new runtime keys inline, no restart needed
 
-### Why not Istiod RTDS?
+Delivery time is bounded by a single gRPC send, not by the number of pods. At 100 pods the delivery time is the same as at 1 pod: under 10ms inside a cluster.
 
-Istiod 1.23+ does not implement `RuntimeDiscoveryService` as a server — it is a consumer of xDS, not a provider of RTDS. The Envoy admin API approach is the correct fast path for Istio 1.23+.
+The EnvoyFilter re-render (5–30s via standard xDS) runs in parallel as a reliable fallback. Pods that have not yet connected to RTDS (e.g. during initial startup) receive the correct config via this path.
+
+### Why shedpilot implements its own RTDS server
+
+Istiod 1.23+ does not implement `RuntimeDiscoveryService` as a server — it is a consumer of xDS, not a provider of RTDS. To get sub-10ms delivery without `kubectl exec` on every pod, shedpilot runs its own minimal RTDS gRPC server. Envoy sidecars connect to it directly — Istiod is not involved in profile switches at all.
 
 ---
 
@@ -344,8 +351,9 @@ Status:
     - EnvoyFilter/payments-adaptive-concurrency
 
   Conditions:
-    Ready:    True  — 3 resources applied via rtds (<200ms), backend: istio
-    Degraded: False
+    Ready:                      True  — 3 resources applied via rtds (<200ms), backend: istio
+    Degraded:                   False
+    SignalCollectionAvailable:  True  — sidecar stats endpoints reachable on TCP 15090
 ```
 
 **status.shedRateNow** — approximate current rejection percentage. Suitable for dashboards; do not alert on this field. Reads `"0%"` when no shedding is active or dryRun is true.
@@ -388,7 +396,7 @@ kubectl delete adaptivepolicy payments -n production
 
 | Mesh | Filters | Streaming | Fast delivery | Status |
 |---|---|---|---|---|
-| Istio sidecar (≥1.23) | ✅ | ✅ DestinationRule | ✅ admin API <200ms | Primary target |
+| Istio sidecar (≥1.23) | ✅ | ✅ DestinationRule | ✅ RTDS gRPC <10ms | Primary target |
 | Istio ambient | ✅ via waypoint | ✅ | ✅ | Supported |
 | Cilium (≥1.14) | ✅ CiliumEnvoyConfig | ✗ | ✗ planned v1.1 | Supported |
 | Linkerd | ✗ | ✗ | ✗ | Not planned — no Envoy filters |
@@ -421,7 +429,8 @@ make deploy IMG=$IMG
 
 | Flag | Default | Description |
 |---|---|---|
-| `--enable-rtds` | `true` | Enable fast delivery via Envoy admin API |
+| `--enable-rtds` | `true` | Enable the RTDS gRPC server for sub-10ms profile switching |
+| `--rtds-port` | `15050` | Port the RTDS gRPC server listens on |
 | `--leader-elect` | `true` | Enable leader election (required for HA) |
 | `--metrics-bind-address` | `:8080` | Prometheus metrics endpoint |
 | `--health-probe-bind-address` | `:8081` | Liveness/readiness probe endpoint |
@@ -434,8 +443,11 @@ resilience.shedpilot.io/adaptivepolicies/status   get, update, patch
 networking.istio.io/envoyfilters                  get, list, watch, create, update, patch, delete
 networking.istio.io/destinationrules              get, list, watch, create, update, patch, delete
 core/pods                                         get, list, watch
-core/pods/exec                                    create  ← required for fast delivery
 ```
+
+**No `pods/exec` required.** Fast delivery is handled by the RTDS gRPC server — Envoy sidecars connect to shedpilot, not the other way around.
+
+**NetworkPolicy note**: the operator pod must be able to reach pod IPs on TCP 15090 (Envoy sidecar stats endpoint) for signal collection. If your cluster uses strict NetworkPolicy, add an egress rule allowing the `shedpilot-system` namespace to reach pods on port 15090. If this is blocked, the `SignalCollectionAvailable` condition will be False and triggers will not fire.
 
 ---
 
@@ -444,6 +456,8 @@ core/pods/exec                                    create  ← required for fast 
 - `admission_control` and `adaptive_concurrency` intercept HTTP/1.1 and unary gRPC only. They cannot intercept long-lived gRPC streaming or WebSocket connections. Use `streamingProtection` for those.
 
 - Signal collection reads `istio_requests_total` from the destination pod's sidecar. When all pods are down simultaneously (scaled to zero), there are no sidecars to scrape — detection cannot fire. This is the correct behaviour: if there are no pods, there is no traffic to shed.
+
+- Signal collection requires the operator pod to reach pod IPs on TCP 15090. If NetworkPolicy blocks this, triggers will not fire and the `SignalCollectionAvailable` condition will be False. The policy still installs filters and protects the service via the EnvoyFilter config — only automatic trigger-based profile switches are affected.
 
 - The `adaptive_concurrency` filter introduces brief elevated 503s during latency baseline recalculation. Configure client-side retries with appropriate backoff on callers.
 

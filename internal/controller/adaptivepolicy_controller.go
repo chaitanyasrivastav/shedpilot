@@ -15,6 +15,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,7 +40,6 @@ import (
 // +kubebuilder:rbac:groups=resilience.shedpilot.io,resources=adaptivepolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=resilience.shedpilot.io,resources=adaptivepolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=networking.istio.io,resources=envoyfilters;destinationrules,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // AdaptivePolicyReconciler reconciles AdaptivePolicy objects.
@@ -122,6 +123,12 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"meshBackend", policy.Spec.MeshBackend,
 	)
 
+	// ── 1.5. Validate policy ──────────────────────────────────────────────────
+
+	if !r.validatePolicy(ctx, policy) {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// ── 2. Detect mesh ────────────────────────────────────────────────────────
 
 	meshRenderer, err := renderer.DetectAndBuild(ctx, r.Client, policy)
@@ -154,6 +161,7 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Non-blocking: consume a debounced poller signal if one is ready.
 	// Otherwise fall back to a direct scrape so status fields stay fresh.
 	var signals trigger.Signals
+	scrapeAvailable := true
 	select {
 	case signals = <-poller.Signals():
 		logger.V(1).Info("poller signal ready",
@@ -164,14 +172,16 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		var signalErr error
 		signals, signalErr = r.scraper.ReadSignals(ctx, policy)
 		if signalErr != nil {
-			logger.V(1).Info("signal read failed, using defaults", "error", signalErr)
+			scrapeAvailable = false
+			logger.Error(signalErr, "signal collection unavailable — triggers will not fire",
+				"hint", "ensure the operator pod can reach pod IPs on TCP 15090 (NetworkPolicy may be blocking)")
 			signals = trigger.Signals{
 				SuccessRate: 0.99,
 				RPS:         0,
 				CollectedAt: time.Now(),
 			}
 		} else {
-			logger.Info("signal read",
+			logger.V(1).Info("signal read",
 				"successRate", fmt.Sprintf("%.4f", signals.SuccessRate),
 				"rps", fmt.Sprintf("%.1f", signals.RPS),
 				"samples", signals.SampleCount,
@@ -313,6 +323,24 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		Message:            fmt.Sprintf("%d resources applied via %s, backend: %s", len(renderResult.Resources), deliveryMethodStr(rtdsConnected, profileSwitched), meshRenderer.Name()),
 		ObservedGeneration: policy.Generation,
 	})
+
+	if scrapeAvailable {
+		setCondition(&policy.Status.Conditions, metav1.Condition{
+			Type:               v1alpha1.ConditionSignalCollectionAvailable,
+			Status:             metav1.ConditionTrue,
+			Reason:             "ScrapingOK",
+			Message:            "sidecar stats endpoints reachable on TCP 15090",
+			ObservedGeneration: policy.Generation,
+		})
+	} else {
+		setCondition(&policy.Status.Conditions, metav1.Condition{
+			Type:               v1alpha1.ConditionSignalCollectionAvailable,
+			Status:             metav1.ConditionFalse,
+			Reason:             "ScrapingFailed",
+			Message:            "cannot reach pod sidecar stats endpoints on TCP 15090 — triggers will not fire. Ensure NetworkPolicy allows operator→pod:15090. Check logs for the specific error.",
+			ObservedGeneration: policy.Generation,
+		})
+	}
 
 	if err := r.Status().Patch(ctx, policy, patch); err != nil {
 		logger.Error(err, "status patch failed")
@@ -544,6 +572,72 @@ func (r *AdaptivePolicyReconciler) ensurePoller(key string, policy *v1alpha1.Ada
 	r.pollerGenerations[key] = policy.Generation
 	go p.Run(ctx)
 	return p
+}
+
+// validatePolicy checks semantic invariants and surfaces violations as Degraded
+// conditions. Returns false when reconciliation should halt (misconfiguration that
+// would result in a no-op or a guaranteed mis-delivery).
+func (r *AdaptivePolicyReconciler) validatePolicy(ctx context.Context, policy *v1alpha1.AdaptivePolicy) bool {
+	// A policy with no active filters does nothing and is almost certainly a mistake.
+	if !policy.HasAdmissionControl() && !policy.HasAdaptiveConcurrency() && !policy.HasStreamingProtection() {
+		_ = r.markDegraded(ctx, policy, "NoActiveFilters",
+			"no filters are configured — this policy has no effect. "+
+				"Set admissionControl.enabled, adaptiveConcurrency.enabled, or "+
+				"streamingProtection.enabled to true.")
+		return false
+	}
+
+	// activeProfile must exist in spec.profiles when set.
+	if policy.Spec.ActiveProfile != "" {
+		if _, ok := policy.Spec.Profiles[policy.Spec.ActiveProfile]; !ok {
+			names := profileNames(policy.Spec.Profiles)
+			msg := fmt.Sprintf("activeProfile %q not found in spec.profiles", policy.Spec.ActiveProfile)
+			if names != "" {
+				msg += fmt.Sprintf(" — defined profiles: %s", names)
+			} else {
+				msg += " — spec.profiles is empty"
+			}
+			_ = r.markDegraded(ctx, policy, "InvalidActiveProfile", msg)
+			return false
+		}
+	}
+
+	// trigger.switchTo and schedule.switchTo must reference profiles that exist.
+	// A trigger that fires and switches to a non-existent profile silently falls
+	// back to baseline, masking the misconfiguration.
+	for _, t := range policy.Spec.Triggers {
+		if _, ok := policy.Spec.Profiles[t.SwitchTo]; !ok {
+			_ = r.markDegraded(ctx, policy, "InvalidTrigger",
+				fmt.Sprintf("trigger %q switchTo %q not found in spec.profiles — "+
+					"define the profile or correct the name. Defined profiles: %s",
+					t.Name, t.SwitchTo, profileNames(policy.Spec.Profiles)))
+			return false
+		}
+	}
+	for _, s := range policy.Spec.Schedules {
+		if _, ok := policy.Spec.Profiles[s.SwitchTo]; !ok {
+			_ = r.markDegraded(ctx, policy, "InvalidSchedule",
+				fmt.Sprintf("schedule %q switchTo %q not found in spec.profiles — "+
+					"define the profile or correct the name. Defined profiles: %s",
+					s.Name, s.SwitchTo, profileNames(policy.Spec.Profiles)))
+			return false
+		}
+	}
+
+	return true
+}
+
+// profileNames returns a sorted, comma-joined list of profile names for error messages.
+func profileNames(profiles map[string]v1alpha1.ProfileConfig) string {
+	if len(profiles) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 // setCondition upserts a condition — updates LastTransitionTime only on status change.

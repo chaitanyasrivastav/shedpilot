@@ -103,6 +103,12 @@ const (
 	// ConditionScalabilityWarning fires when shedding has been active for too
 	// long — indicating a capacity problem, not a traffic spike.
 	ConditionScalabilityWarning = "ScalabilityWarning"
+
+	// ConditionSignalCollectionAvailable is False when the operator cannot reach
+	// pod sidecar stats endpoints (port 15090). When False, triggers will not fire
+	// because there are no live success-rate signals. Check NetworkPolicy rules —
+	// the operator pod must be able to reach pod IPs on TCP 15090.
+	ConditionSignalCollectionAvailable = "SignalCollectionAvailable"
 )
 
 // ─── Enum types ───────────────────────────────────────────────────────────────
@@ -291,6 +297,27 @@ type AdmissionControlConfig struct {
 	// gRPC status 0 (OK) is always counted as success.
 	// +optional
 	SuccessCodes []HTTPStatusRange `json:"successCodes,omitempty"`
+
+	// SkipPaths is a list of URL path prefixes that bypass admission control.
+	// Requests whose path starts with any entry are allowed through immediately,
+	// regardless of the current success rate.
+	//
+	// Primary use: Kubernetes liveness and readiness probe endpoints. Without
+	// skip paths, active shedding can reject health probes → kubelet marks the
+	// pod unhealthy → pod is killed → cascading failure under the load you were
+	// trying to shed.
+	//
+	// Note: Istio rewrites kubelet probes to port 15021 by default (on since 1.4).
+	// SkipPaths is only needed if you disabled Istio probe rewriting, expose health
+	// probes on the service port directly, or use Cilium.
+	//
+	// Paths are matched as prefixes: "/healthz" matches "/healthz" and "/healthz/ready".
+	// Matched paths receive an immediate 200 OK from Envoy; they do not reach the service.
+	// Do NOT include /metrics here — use a separate port for Prometheus scraping instead.
+	//
+	// Recommended: ["/healthz", "/readyz", "/livez"]
+	// +optional
+	SkipPaths []string `json:"skipPaths,omitempty"`
 }
 
 // HTTPStatusRange is an inclusive range of HTTP status codes.
