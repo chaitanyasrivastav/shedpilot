@@ -109,6 +109,16 @@ const (
 	// because there are no live success-rate signals. Check NetworkPolicy rules —
 	// the operator pod must be able to reach pod IPs on TCP 15090.
 	ConditionSignalCollectionAvailable = "SignalCollectionAvailable"
+
+	// ConditionFilterEffective is False when admission_control is installed but
+	// has rejected zero requests across multiple intervals while the success rate
+	// is below threshold and RPS exceeds minRequestsPerSecond. This indicates the
+	// filter is not intercepting traffic — it is installed in the chain but not
+	// processing requests. Common causes: the EnvoyFilter has not propagated yet,
+	// the filter is matched to a listener context that receives no traffic, or the
+	// service port is not proxied by Istio. Check with:
+	//   kubectl exec <pod> -c istio-proxy -- curl -s localhost:15000/stats | grep admission_control
+	ConditionFilterEffective = "FilterEffective"
 )
 
 // ─── Enum types ───────────────────────────────────────────────────────────────

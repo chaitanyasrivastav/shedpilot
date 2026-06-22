@@ -354,6 +354,7 @@ Status:
     Ready:                      True  — 3 resources applied via rtds (<200ms), backend: istio
     Degraded:                   False
     SignalCollectionAvailable:  True  — sidecar stats endpoints reachable on TCP 15090
+    FilterEffective:            True  — admission_control is actively rejecting requests (312.0/s)
 ```
 
 **status.shedRateNow** — approximate current rejection percentage. Suitable for dashboards; do not alert on this field. Reads `"0%"` when no shedding is active or dryRun is true.
@@ -466,6 +467,8 @@ core/pods                                         get, list, watch
 - `spec.detection` changes take effect on the next reconcile — no operator restart required.
 
 - Cilium fast delivery is planned for v1.1. Currently, Cilium profile switches use CiliumEnvoyConfig re-render (5–30s delivery).
+
+- `status.shedRateNow` is derived from the actual `envoy_http_admission_control_requests_ejected` counter. It reads `"0%"` when no requests are being rejected — this is ambiguous: it means either the service is healthy (success rate above threshold) or the filter is installed but not processing traffic. The `FilterEffective` condition disambiguates this: it is `False` when the service is degraded (success rate below threshold, RPS above minimum) but the filter is counting zero ejections. If you see `FilterEffective=False`, verify the filter is installed in the correct listener with: `kubectl exec -n <namespace> <pod> -c istio-proxy -- curl -s localhost:15000/stats | grep admission_control`
 
 - Chronic shedding (daily, predictable) is a capacity problem, not a traffic spike. shedpilot surfaces this via `status.scalabilityWarning`. The correct response is to provision more capacity — not to tune thresholds further.
 

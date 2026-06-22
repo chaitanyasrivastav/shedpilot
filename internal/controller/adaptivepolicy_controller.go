@@ -289,9 +289,11 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	policy.Status.ConsecutiveBadSamples = decision.ConsecutiveBadSamples
 	policy.Status.RTDSConnected = rtdsConnected
 
-	// Shed rate — approximate from success rate signal
-	// 0% when healthy, non-zero when admission control is active
-	policy.Status.ShedRateNow = estimateShedRate(signals, policy)
+	// Shed rate — from actual envoy_http_admission_control_requests_ejected counter.
+	// Distinct from the old success-rate estimate: this is zero when the filter
+	// is not rejecting (whether healthy or misconfigured), non-zero only when
+	// Envoy's admission_control is actively ejecting requests.
+	policy.Status.ShedRateNow = actualShedRate(signals, policy)
 
 	if decision.Reason != "" && decision.ShouldSwitch {
 		deliveryMethod := "envoyfilter"
@@ -340,6 +342,53 @@ func (r *AdaptivePolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			Message:            "cannot reach pod sidecar stats endpoints on TCP 15090 — triggers will not fire. Ensure NetworkPolicy allows operator→pod:15090. Check logs for the specific error.",
 			ObservedGeneration: policy.Generation,
 		})
+	}
+
+	// FilterEffective — detect filter installed but not processing traffic.
+	// Only meaningful when admission_control is enabled, not dryRun, and we have
+	// live signal data. Fires after 3 consecutive intervals of evidence.
+	if policy.HasAdmissionControl() && !policy.IsDryRun() && scrapeAvailable {
+		minRPS := float64(5)
+		if policy.Spec.AdmissionControl.MinRequestsPerSecond > 0 {
+			minRPS = float64(policy.Spec.AdmissionControl.MinRequestsPerSecond)
+		}
+		threshold := mustParsePercent(policy.EffectiveSuccessRateThreshold()) / 100.0
+
+		shouldBeShedding := signals.RPS > minRPS && signals.SuccessRate < threshold
+		filterIsEjecting := signals.ShedRejectedRPS > 0
+
+		if shouldBeShedding && !filterIsEjecting {
+			policyState.ConsecutiveFilterInactive++
+		} else {
+			policyState.ConsecutiveFilterInactive = 0
+		}
+
+		const filterInactiveThreshold = 3
+		if policyState.ConsecutiveFilterInactive >= filterInactiveThreshold {
+			setCondition(&policy.Status.Conditions, metav1.Condition{
+				Type:   v1alpha1.ConditionFilterEffective,
+				Status: metav1.ConditionFalse,
+				Reason: "ZeroEjections",
+				Message: fmt.Sprintf(
+					"admission_control has rejected 0 requests over %d consecutive intervals "+
+						"while successRate=%.3f is below threshold=%.3f and RPS=%.0f exceeds minimum=%.0f. "+
+						"The filter may not be intercepting traffic. Verify with: "+
+						"kubectl exec -n %s <pod> -c istio-proxy -- curl -s localhost:15000/stats | grep admission_control",
+					policyState.ConsecutiveFilterInactive,
+					signals.SuccessRate, threshold, signals.RPS, minRPS,
+					policy.Namespace,
+				),
+				ObservedGeneration: policy.Generation,
+			})
+		} else if filterIsEjecting {
+			setCondition(&policy.Status.Conditions, metav1.Condition{
+				Type:               v1alpha1.ConditionFilterEffective,
+				Status:             metav1.ConditionTrue,
+				Reason:             "EjectionsObserved",
+				Message:            fmt.Sprintf("admission_control is actively rejecting requests (%.1f/s)", signals.ShedRejectedRPS),
+				ObservedGeneration: policy.Generation,
+			})
+		}
 	}
 
 	if err := r.Status().Patch(ctx, policy, patch); err != nil {
@@ -436,36 +485,33 @@ func (r *AdaptivePolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// estimateShedRate approximates the current shed percentage from signals.
-// When success rate is below the effective threshold, admission control is
-// actively shedding. This is an approximation — not suitable for alerting.
-func estimateShedRate(signals trigger.Signals, policy *v1alpha1.AdaptivePolicy) string {
+// actualShedRate returns the real rejection rate from the admission_control
+// Envoy filter, derived from the envoy_http_admission_control_requests_ejected
+// counter delta. Returns "0%" when no requests are being rejected, whether
+// because the service is healthy or because the filter is not processing traffic.
+// This replaces the old success-rate estimate which could mislead operators into
+// thinking the filter was active when it was actually counting zero requests.
+func actualShedRate(signals trigger.Signals, policy *v1alpha1.AdaptivePolicy) string {
 	if !policy.HasAdmissionControl() || policy.IsDryRun() {
 		return "0%"
 	}
-	if signals.RPS < 1 {
+	if signals.ShedRejectedRPS <= 0 || signals.RPS <= 0 {
 		return "0%"
 	}
-	// If success rate is below threshold, shedding is active.
-	// The actual shed rate depends on sheddingSpeed — we show an approximation.
-	threshold := 0.95
-	fmt.Sscanf(policy.EffectiveSuccessRateThreshold(), "%f", &threshold)
-	threshold /= 100
+	// Rejected requests are counted in signals.RPS (they appear as 503s in
+	// istio_requests_total). So total = RPS, and shed fraction = rejected/total.
+	rate := signals.ShedRejectedRPS / signals.RPS * 100
+	if rate > 100 {
+		rate = 100
+	}
+	return fmt.Sprintf("~%.0f%%", rate)
+}
 
-	if signals.SuccessRate >= threshold {
-		return "0%"
-	}
-
-	// Approximate shed rate using the Client-Side Throttling formula inverse:
-	// shedRate ≈ 1 - successRate/threshold
-	shed := (1 - signals.SuccessRate/threshold) * 100
-	if shed < 0 {
-		shed = 0
-	}
-	if shed > 80 {
-		shed = 80 // maxRejectionPercent default cap
-	}
-	return fmt.Sprintf("~%.0f%%", shed)
+// mustParsePercent parses a percent string like "95.0" to float64.
+func mustParsePercent(s string) float64 {
+	var f float64
+	fmt.Sscanf(s, "%f", &f)
+	return f
 }
 
 // deliveryMethodStr returns a human-readable delivery method string.

@@ -18,6 +18,12 @@ type Signals struct {
 	RPS              float64
 	SampleCount      int64
 	CollectedAt      time.Time
+
+	// ShedRejectedRPS is the rate of requests actually rejected by the
+	// admission_control Envoy filter (from envoy_http_admission_control_requests_ejected).
+	// Zero means the filter is either not shedding or not processing any traffic.
+	// Distinct from the SuccessRate-based estimate — this is the ground truth.
+	ShedRejectedRPS float64
 }
 
 // Decision is what the evaluator decided should happen.
@@ -33,6 +39,11 @@ type Decision struct {
 type State struct {
 	ConsecutiveBadSamples map[string]int32
 	LastTriggerFireTime   map[string]time.Time
+
+	// ConsecutiveFilterInactive counts intervals where admission_control should
+	// be rejecting requests (success rate below threshold, RPS above minimum)
+	// but ShedRejectedRPS is zero. Used to set the FilterEffective condition.
+	ConsecutiveFilterInactive int32
 }
 
 // NewState creates an empty evaluation state.

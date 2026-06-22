@@ -187,12 +187,15 @@ func (s *Scraper) ReadSignals(
 		successRate = 1.0
 	}
 
+	intervalSec := intervalDuration.Seconds()
+
 	return trigger.Signals{
 		SuccessRate:      successRate,
 		ServiceLatencyMs: 0, // v2 OTel fills this
 		TotalLatencyMs:   0,
-		RPS:              totalRqDelta / intervalDuration.Seconds(),
+		RPS:              totalRqDelta / intervalSec,
 		SampleCount:      int64(totalRqDelta),
+		ShedRejectedRPS:  shedDelta / intervalSec,
 		CollectedAt:      now,
 	}, nil
 }
